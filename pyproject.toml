@@ -1,0 +1,80 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ace-step-api"
+version = "0.1.0"
+description = "Make music with ACE-Step 1.5 on an Apple Silicon Mac as an HTTP job API"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "kabatin" }]
+keywords = ["ace-step", "music-generation", "apple-silicon", "text-to-music", "fastapi"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: FastAPI",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+  "Topic :: Multimedia :: Sound/Audio",
+]
+dependencies = [
+  "fastapi>=0.132",  # older versions parse Content-Type-less bodies as JSON (CSRF)
+  "uvicorn>=0.30",
+  "pydantic>=2.8",
+]
+
+[project.urls]
+Homepage = "https://github.com/kabatin/ace-step-api"
+Issues = "https://github.com/kabatin/ace-step-api/issues"
+
+[project.scripts]
+ace-step-api = "ace_step_api.cli:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3",
+  "pytest-cov>=5.0",
+  "ruff>=0.6",
+  "pyright>=1.1.380",
+  "httpx2>=2.13.1",
+  "numpy>=1.26",  # the worker's limiter, run in tests against tests/fake_acestep
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ace_step_api"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "SIM", "RUF", "PTH", "T20"]
+ignore = [
+  "S603", # subprocess without shell=True is exactly what we want
+  "S607", # tools (pmset, memory_pressure) are resolved from PATH on purpose
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "S105", "S106", "S108", "PTH"]
+# the fake engine prints to stdout on purpose: the worker must keep it off the protocol
+"tests/fake_acestep/**" = ["T201"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "standard"
+pythonVersion = "3.12"
+
+[tool.coverage.run]
+# runs in the ACE-Step checkout's Python as a child process; tests/test_engine.py drives it
+# end to end against tests/fake_acestep
+omit = ["*/acestep_worker.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --cov=ace_step_api --cov-report=term-missing --cov-fail-under=80"
+markers = [
+  "real: runs a real ACE-Step generation (opt-in: ACE_STEP_API_REAL_TESTS=1)",
+]

@@ -1,0 +1,222 @@
+"""Hardening: loopback-only mode, token rules, idempotency, busy gate, ids, cleanup, audio."""
+
+import os
+import time
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from ace_step_api.api.app import create_app
+from ace_step_api.api.security import host_name
+from ace_step_api.audio import AudioError, inspect_wav
+from ace_step_api.checks import Level
+from ace_step_api.doctor import check_config_file
+from ace_step_api.jobs.queue import JobQueue
+from ace_step_api.jobs.store import JobStore
+from ace_step_api.settings import SettingsError, load_settings
+from ace_step_api.workflows.base import WorkflowRegistry
+from tests.fakes import EchoParams, EchoWorkflow, FakeMusicBackend
+
+TOKEN = "t" * 40
+
+
+@pytest.fixture
+def backend() -> FakeMusicBackend:
+    return FakeMusicBackend()
+
+
+@pytest.fixture
+def queue(tmp_path: Path, backend: FakeMusicBackend) -> JobQueue:
+    return JobQueue(
+        JobStore(tmp_path),
+        WorkflowRegistry([EchoWorkflow()]),
+        backend,
+        max_waiting=1,
+        timeout_factor=2,
+        retention_days=7,
+    )
+
+
+@pytest.fixture
+def client(queue: JobQueue, backend: FakeMusicBackend) -> Iterator[TestClient]:
+    app = create_app(queue, WorkflowRegistry([EchoWorkflow()]), token=None, max_body_bytes=1 << 20)
+    with TestClient(app, base_url="http://127.0.0.1") as c:
+        yield c
+    backend.release.set()
+
+
+# -- loopback-only mode (no token) -------------------------------------------------------
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1:8768", "localhost:8768", "[::1]:8768", "LOCALHOST"])
+def test_loopback_hosts_are_served(client: TestClient, host: str) -> None:
+    assert client.get("/v1/health", headers={"Host": host}).status_code == 200
+
+
+def test_rebinding_host_is_refused(client: TestClient) -> None:
+    denied = client.get("/v1/health", headers={"Host": "attacker.example"})
+    assert denied.status_code == 403 and denied.json()["error"]["code"] == "forbidden_host"
+
+
+@pytest.mark.parametrize("header", ["X-Forwarded-For", "Forwarded", "X-Real-IP"])
+def test_proxied_requests_need_a_token(client: TestClient, header: str) -> None:
+    denied = client.get("/v1/health", headers={header: "203.0.113.9"})
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "proxy_requires_token"
+
+
+def test_host_name_parsing() -> None:
+    assert host_name("[::1]:8768") == "::1"
+    assert host_name("localhost:1") == "localhost"
+    assert host_name("127.0.0.1") == "127.0.0.1"
+    assert host_name("[broken") == "[broken"
+
+
+def test_body_without_content_type_is_not_json(client: TestClient) -> None:
+    # a cross-site "simple" POST (no preflight) must not be accepted as a job
+    sent = client.post("/v1/workflows/echo/jobs", content=b'{"text":"x"}')
+    assert sent.status_code == 422
+
+
+# -- tokens and binding --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("token", ["short", "has space " * 5, "ü" * 40])
+def test_weak_tokens_are_rejected(tmp_path: Path, token: str) -> None:
+    with pytest.raises(SettingsError, match="printable ASCII"):
+        load_settings(env={"ACE_STEP_API_TOKEN": token}, config_path=tmp_path / "x")
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "192.168.1.20", "::", "mac.local"])
+def test_remote_bind_without_token_is_refused(tmp_path: Path, host: str) -> None:
+    with pytest.raises(SettingsError, match="ACE_STEP_API_TOKEN"):
+        load_settings(env={"ACE_STEP_API_HOST": host}, config_path=tmp_path / "x")
+
+
+def test_bearer_scheme_is_case_insensitive(queue: JobQueue) -> None:
+    app = create_app(queue, WorkflowRegistry([EchoWorkflow()]), token=TOKEN, max_body_bytes=1024)
+    with TestClient(app) as c:
+        assert c.get("/v1/health", headers={"Authorization": f"bearer {TOKEN}"}).status_code == 200
+        assert c.get("/v1/health", headers={"Authorization": f"Basic {TOKEN}"}).status_code == 401
+        # with a token, any Host is fine (the LAN case)
+        ok = c.get("/v1/health", headers={"Authorization": f"Bearer {TOKEN}", "Host": "mac.lan"})
+        assert ok.status_code == 200
+
+
+# -- idempotency and the busy gate -------------------------------------------------------
+
+
+def test_idempotent_resubmission_over_http(client: TestClient, backend: FakeMusicBackend) -> None:
+    backend.block = True
+    headers = {"Idempotency-Key": "gen-42"}
+    first = client.post("/v1/workflows/echo/jobs", json={"text": "a"}, headers=headers)
+    assert first.status_code == 202
+    assert backend.started.wait(2)
+    again = client.post("/v1/workflows/echo/jobs", json={"text": "a"}, headers=headers)
+    assert again.status_code == 200 and again.json()["id"] == first.json()["id"]
+    clash = client.post("/v1/workflows/echo/jobs", json={"text": "b"}, headers=headers)
+    assert clash.status_code == 409 and clash.json()["error"]["code"] == "idempotency_conflict"
+    bad = client.post(
+        "/v1/workflows/echo/jobs",
+        json={"text": "a"},
+        headers={"Idempotency-Key": "no spaces allowed"},
+    )
+    assert bad.status_code == 422
+    assert len(backend.calls) == 1  # one generation, however often the client retried
+
+
+def test_busy_gate_answers_before_reading_the_body(
+    client: TestClient, backend: FakeMusicBackend
+) -> None:
+    backend.block = True
+    client.post("/v1/workflows/echo/jobs", json={"text": "a"}, headers={"Idempotency-Key": "k1"})
+    assert backend.started.wait(2)
+    client.post("/v1/workflows/echo/jobs", json={"text": "b"})
+    # the body is not even JSON: only a gate in front of parsing can answer 429 here
+    busy = client.post(
+        "/v1/workflows/echo/jobs", content=b"not json", headers={"Content-Type": "application/json"}
+    )
+    assert busy.status_code == 429 and "retry-after" in busy.headers
+    # a key that already has a job still gets that job back
+    known = client.post(
+        "/v1/workflows/echo/jobs", json={"text": "a"}, headers={"Idempotency-Key": "k1"}
+    )
+    assert known.status_code == 200
+
+
+# -- ids, cleanup ------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("job_id", ["job_%00", "job_" + "A" * 300, "..", "job_abc"])
+def test_malformed_ids_are_404(client: TestClient, job_id: str) -> None:
+    assert client.get(f"/v1/jobs/{job_id}").status_code == 404
+
+
+def test_output_route_never_reads_other_files(client: TestClient) -> None:
+    for path in ("/v1/jobs/..%2F..%2Fetc%2Fpasswd/output", "/v1/jobs/job_../output"):
+        assert client.get(path).status_code == 404
+
+
+def _wait(predicate, timeout: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out")
+        time.sleep(0.02)
+
+
+def test_inputs_are_dropped_after_cancel_and_finish(
+    queue: JobQueue, backend: FakeMusicBackend, tmp_path: Path
+) -> None:
+    queue.start()
+    try:
+        backend.block = True
+        running, _ = queue.submit(EchoWorkflow(), EchoParams(text="a"))
+        assert backend.started.wait(2)
+        waiting, _ = queue.submit(EchoWorkflow(), EchoParams(text="b"))
+        queue.cancel(waiting.id)
+        assert not (tmp_path / "jobs" / waiting.id / "inputs").exists()
+        backend.release.set()
+        _wait(lambda: queue.view(running.id).record.status.finished)
+        _wait(lambda: not (tmp_path / "jobs" / running.id / "inputs").exists())
+        assert (tmp_path / "jobs" / running.id / "job.json").is_file()
+    finally:
+        queue.stop(timeout_s=5)
+
+
+# -- audio ---------------------------------------------------------------------------------
+
+
+def test_unreadable_wav_is_an_audio_error(tmp_path: Path) -> None:
+    bad = tmp_path / "bad.wav"
+    bad.write_bytes(b"RIFF\x00\x00\x00\x00WAVEfmt garbage")
+    with pytest.raises(AudioError) as info:
+        inspect_wav(bad)
+    assert "0x" not in str(info.value) and str(tmp_path) not in str(info.value)
+
+
+def test_float_wav_is_refused(tmp_path: Path) -> None:
+    import struct as st
+
+    path = tmp_path / "float.wav"
+    fmt = st.pack("<HHIIHH", 3, 2, 48000, 48000 * 8, 8, 32)  # WAVE_FORMAT_IEEE_FLOAT
+    data = b"\x00" * 64
+    body = b"WAVE" + b"fmt " + st.pack("<I", len(fmt)) + fmt + b"data" + st.pack("<I", len(data))
+    path.write_bytes(b"RIFF" + st.pack("<I", len(body) + len(data)) + body + data)
+    with pytest.raises(AudioError):
+        inspect_wav(path)
+
+
+# -- config file ----------------------------------------------------------------------------
+
+
+def test_config_file_permissions(tmp_path: Path) -> None:
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'token = "{TOKEN}"\n')
+    os.chmod(cfg, 0o644)
+    assert check_config_file(cfg).level is Level.WARN
+    os.chmod(cfg, 0o600)
+    assert check_config_file(cfg).level is Level.OK
+    assert check_config_file(None).level is Level.OK
