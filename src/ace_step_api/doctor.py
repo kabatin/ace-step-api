@@ -113,7 +113,7 @@ def check_memory() -> Check:
         return Check("memory", Level.WARN, "memory_pressure unavailable")
     free = int(match.group(1))
     level = Level.OK if free >= MIN_MEMORY_FREE_PERCENT else Level.WARN
-    return Check("memory", level, f"{free}% free (the loaded models need ~10 GB)")
+    return Check("memory", level, f"{free}% free (the loaded engine peaks at ~19 GB)")
 
 
 def run_smoke(settings: Settings, backend: MusicBackend, workflow: Workflow) -> Check:
