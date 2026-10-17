@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from ace_step_api.api.app import create_app
 from ace_step_api.api.security import host_name
-from ace_step_api.audio import AudioError, inspect_wav
+from ace_step_api.audio import AudioError, inspect_wav, wav_problem
 from ace_step_api.checks import Level
 from ace_step_api.doctor import check_config_file
 from ace_step_api.jobs.queue import JobQueue
@@ -205,8 +205,12 @@ def test_float_wav_is_refused(tmp_path: Path) -> None:
     data = b"\x00" * 64
     body = b"WAVE" + b"fmt " + st.pack("<I", len(fmt)) + fmt + b"data" + st.pack("<I", len(data))
     path.write_bytes(b"RIFF" + st.pack("<I", len(body) + len(data)) + body + data)
-    with pytest.raises(AudioError):
-        inspect_wav(path)
+    try:
+        info = inspect_wav(path)
+    except AudioError:
+        return  # Python < 3.15: the wave module cannot read float WAV at all
+    # Python 3.15+ reads it; the delivery check still refuses anything but 16-bit PCM
+    assert wav_problem(info) == "output is 32-bit, expected 16-bit PCM"
 
 
 # -- config file ----------------------------------------------------------------------------
