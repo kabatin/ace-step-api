@@ -13,32 +13,20 @@ Apple Silicon port expose the same Python API):
 
 from __future__ import annotations
 
-import logging
 import os
-import threading
-import time
-from collections.abc import Callable
 from pathlib import Path
 from typing import Any, ClassVar
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field
 
-from ace_step_api.backends.base import (
-    GenerationPlan,
-    GenerationRequest,
-    GenerationResult,
-    MusicBackend,
-    ProgressCallback,
-)
-from ace_step_api.backends.engine import EngineConfig, EngineError, ResidentEngine
+from ace_step_api.backends.base import GenerationRequest
+from ace_step_api.backends.engine import EngineConfig
+from ace_step_api.backends.resident import ResidentBackend, parse_options
 from ace_step_api.checks import Check, Level
-from ace_step_api.logs import event
-from ace_step_api.settings import Settings, SettingsError
-
-log = logging.getLogger("ace_step_api.acestep")
+from ace_step_api.settings import Settings
 
 BACKEND_NAME = "acestep"
-MODEL_FILE = "model.safetensors"
+WORKER_SCRIPT = Path(__file__).with_name("acestep_worker.py")
 # measured on the target Mac (M5, 32 GB, the Apple Silicon port): loads took 19-38 s, a 60 s
 # track 32-36 s and a 240 s track 121 s once loaded (README "Measurements"); kept conservative
 LOAD_SECONDS = 40.0
@@ -70,9 +58,26 @@ class AceStepOptions(BaseModel):
     seconds_per_audio_second: float = Field(default=SECONDS_PER_AUDIO_SECOND, gt=0.0, le=60.0)
 
 
-class AceStepBackend(MusicBackend):
+def acestep_args(
+    project_root: Path, dit_model: str, lm_model: str, lm_backend: str, mlx_dit: bool | None
+) -> tuple[str, ...]:
+    """The ACE-Step worker's own arguments (after ``--proto-fd``)."""
+    return (
+        "--project-root",
+        str(project_root),
+        "--dit-model",
+        dit_model,
+        "--lm-model",
+        lm_model,
+        "--lm-backend",
+        lm_backend,
+        *(() if mlx_dit is None else ("--mlx-dit", "on" if mlx_dit else "off")),
+    )
+
+
+class AceStepBackend(ResidentBackend):
     name: ClassVar[str] = BACKEND_NAME
-    supports_cancel: ClassVar[bool] = True  # the worker is killed; the GPU is released
+    track_detail_keys: ClassVar[tuple[str, ...]] = ("gain_db", "limiter_db")
 
     def __init__(
         self,
@@ -82,36 +87,34 @@ class AceStepBackend(MusicBackend):
         poll_seconds: float = 5.0,
     ) -> None:
         self.options = options or AceStepOptions()
-        self.engine = ResidentEngine(
-            EngineConfig(
-                python=self.python_path,
-                project_root=self.project_root or Path(),
-                dit_model=self.options.dit_model,
-                lm_model=self.options.lm_model,
-                lm_backend=self.options.lm_backend,
-                mlx_dit=self.options.mlx_dit,
-                state_dir=state_dir,
-                idle_seconds=self.options.resident_idle_seconds,
-                poll_seconds=poll_seconds,
-                start_timeout_s=self.options.start_timeout_s,
-                stop_grace_s=self.options.stop_grace_s,
-                env=self.worker_env(),
-            )
-        )
+        self.state_dir = state_dir
+        self.poll_seconds = poll_seconds
+        super().__init__(load_seconds=self.options.load_seconds)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> AceStepBackend:
-        try:
-            options = AceStepOptions.model_validate(dict(settings.backend_options(BACKEND_NAME)))
-        except ValidationError as exc:
-            problems = "; ".join(
-                f"{'.'.join(str(p) for p in err['loc'])}: {err['msg']}" for err in exc.errors()
-            )
-            raise SettingsError(f"invalid [backends.{BACKEND_NAME}] options: {problems}") from exc
         return cls(
-            options,
+            parse_options(AceStepOptions, settings, BACKEND_NAME),
+            # where 0.1.0 kept it: a restart after the upgrade still reaps a leftover worker
             state_dir=settings.data_dir / "engine",
             poll_seconds=settings.coordination_poll_seconds,
+        )
+
+    def engine_config(self) -> EngineConfig:
+        o = self.options
+        root = self.project_root or Path()
+        return EngineConfig(
+            name=BACKEND_NAME,
+            python=self.python_path,
+            script=WORKER_SCRIPT,
+            args=acestep_args(root, o.dit_model, o.lm_model, o.lm_backend, o.mlx_dit),
+            cwd=root,
+            state_dir=self.state_dir,
+            idle_seconds=o.resident_idle_seconds,
+            poll_seconds=self.poll_seconds,
+            start_timeout_s=o.start_timeout_s,
+            stop_grace_s=o.stop_grace_s,
+            env=self.worker_env(),
         )
 
     # -- paths -----------------------------------------------------------------------
@@ -141,18 +144,45 @@ class AceStepBackend(MusicBackend):
     def required_models(self) -> list[str]:
         return [self.options.dit_model, "vae", "Qwen3-Embedding-0.6B", self.options.lm_model]
 
+    def missing_models(self, root: Path) -> list[str]:
+        checkpoints = root / "checkpoints"
+        return [
+            name
+            for name in self.required_models()
+            if not any((checkpoints / name).glob("*.safetensors"))
+        ]
+
     # -- planning --------------------------------------------------------------------
     def typical_seconds(self, duration_s: float) -> float:
         o = self.options
         return o.track_overhead_seconds + o.seconds_per_audio_second * duration_s
 
-    def plan(self, request: GenerationRequest) -> GenerationPlan:
-        load = 0.0 if self.engine.running() else self.options.load_seconds
-        estimate = load + self.typical_seconds(request.duration_s) * request.count
-        return GenerationPlan(request.count, estimate_seconds=round(estimate, 1))
+    def track_request(self, request: GenerationRequest, seed: int, out: Path) -> dict[str, Any]:
+        return {
+            "caption": request.prompt,
+            "lyrics": request.lyrics,
+            "instrumental": request.instrumental,
+            "vocal_language": request.vocal_language,
+            "duration": request.duration_s,
+            "seed": seed,
+            "out": str(out),
+        }
 
     # -- health ----------------------------------------------------------------------
-    def health(self) -> list[Check]:
+    def unavailable_reason(self) -> str | None:
+        root = self.project_root
+        if root is None:
+            return f"not configured (set project_root in [backends.{BACKEND_NAME}])"
+        if not (root / "acestep").is_dir():
+            return "the ACE-Step checkout is missing"
+        if not os.access(self.python_path, os.X_OK):
+            return "the ACE-Step Python is missing (run `uv sync` in the checkout)"
+        missing = self.missing_models(root)
+        if missing:
+            return f"model files missing: {', '.join(missing)}"
+        return None
+
+    def checks(self) -> list[Check]:
         root = self.project_root
         if root is None:
             return [
@@ -177,11 +207,7 @@ class AceStepBackend(MusicBackend):
             ),
         ]
         checkpoints = root / "checkpoints"
-        missing = [
-            name
-            for name in self.required_models()
-            if not any((checkpoints / name).glob("*.safetensors"))
-        ]
+        missing = self.missing_models(root)
         checks.append(
             Check(
                 "ACE-Step models",
@@ -194,146 +220,9 @@ class AceStepBackend(MusicBackend):
         idle = self.options.resident_idle_seconds
         checks.append(
             Check(
-                "resident engine",
+                "ACE-Step resident engine",
                 Level.OK,
                 f"models stay loaded {idle:.0f} s after a job" if idle else "off (load per job)",
             )
         )
         return checks
-
-    # -- generation ------------------------------------------------------------------
-    def generate(
-        self,
-        request: GenerationRequest,
-        run_dir: Path,
-        *,
-        timeout_s: float,
-        cancel: threading.Event,
-        on_progress: ProgressCallback | None = None,
-    ) -> GenerationResult:
-        plan = self.plan(request)
-        started = time.monotonic()
-        deadline = started + timeout_s
-        try:
-            run_dir.mkdir(parents=True, exist_ok=True)
-        except OSError as exc:
-            return GenerationResult(plan=plan, duration_s=0.0, failure=f"cannot prepare: {exc}")
-        if self.project_root is None:
-            return GenerationResult(
-                plan=plan,
-                duration_s=0.0,
-                failure="no ACE-Step checkout configured",
-                failure_code="backend_unavailable",
-            )
-        result: GenerationResult | None = None
-        try:
-            result = self._run(request, plan, run_dir, started, deadline, cancel, on_progress)
-            return result
-        finally:
-            # a canceled or failed track may leave the GPU busy: never reuse that worker
-            ok = result is not None and result.ok
-            self.engine.release(discard=not ok, job_id=request.job_id)
-
-    def _run(
-        self,
-        request: GenerationRequest,
-        plan: GenerationPlan,
-        run_dir: Path,
-        started: float,
-        deadline: float,
-        cancel: threading.Event,
-        on_progress: ProgressCallback | None,
-    ) -> GenerationResult:
-        def elapsed() -> float:
-            return time.monotonic() - started
-
-        try:
-            loaded = self.engine.acquire(request.job_id, cancel, deadline)
-        except EngineError as exc:
-            return GenerationResult(
-                plan=plan, duration_s=elapsed(), failure=str(exc), failure_code="engine_failed"
-            )
-        if not loaded:
-            return GenerationResult(
-                plan=plan,
-                duration_s=elapsed(),
-                canceled=cancel.is_set(),
-                timed_out=not cancel.is_set(),
-            )
-        details: dict[str, Any] = {"load_seconds": self.engine.last_load_s, "tracks": []}
-        outputs: list[Path] = []
-        for index in range(request.count):
-            out = run_dir / f"raw-{index}.wav"
-            outcome = self.engine.run_track(
-                request.job_id,
-                {
-                    "caption": request.prompt,
-                    "lyrics": request.lyrics,
-                    "instrumental": request.instrumental,
-                    "vocal_language": request.vocal_language,
-                    "duration": request.duration_s,
-                    "seed": request.seed + index,
-                    "out": str(out.resolve()),
-                },
-                cancel=cancel,
-                deadline=deadline,
-                on_progress=_scaled(on_progress, index, request.count),
-            )
-            details["tracks"].append(
-                {
-                    "index": index,
-                    "seconds": round(outcome.seconds, 2),
-                    "gain_db": outcome.reply.get("gain_db"),
-                    "limiter_db": outcome.reply.get("limiter_db"),
-                }
-            )
-            if not outcome.ok:
-                return GenerationResult(
-                    plan=plan,
-                    duration_s=elapsed(),
-                    outputs=tuple(outputs),
-                    canceled=outcome.canceled,
-                    timed_out=outcome.timed_out,
-                    failure=outcome.failure,
-                    details=details,
-                )
-            if not out.is_file() or out.stat().st_size == 0:
-                return GenerationResult(
-                    plan=plan,
-                    duration_s=elapsed(),
-                    outputs=tuple(outputs),
-                    failure=f"track {index}: the engine wrote no audio",
-                    details=details,
-                )
-            outputs.append(out)
-            event(
-                log,
-                "engine.track",
-                job_id=request.job_id,
-                index=index,
-                seconds=round(outcome.seconds, 2),
-            )
-        return GenerationResult(
-            plan=plan, duration_s=elapsed(), outputs=tuple(outputs), details=details
-        )
-
-    def startup(self) -> str | None:
-        return self.engine.reap_leftover()
-
-    def shutdown(self) -> None:
-        self.engine.shutdown()
-
-    def set_peer_check(self, check: Callable[[], bool] | None) -> None:
-        self.engine.set_peer_check(check)
-
-
-def _scaled(
-    on_progress: ProgressCallback | None, index: int, count: int
-) -> Callable[[float], None] | None:
-    if on_progress is None:
-        return None
-
-    def report(fraction: float) -> None:
-        on_progress(min(max((index + fraction) / count, 0.0), 1.0))
-
-    return report

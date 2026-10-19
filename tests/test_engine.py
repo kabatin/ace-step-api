@@ -14,10 +14,14 @@ from pathlib import Path
 
 import pytest
 
-from ace_step_api.backends.acestep import AceStepBackend, AceStepOptions
+from ace_step_api.backends.acestep import (
+    WORKER_SCRIPT,
+    AceStepBackend,
+    AceStepOptions,
+    acestep_args,
+)
 from ace_step_api.backends.base import GenerationRequest
 from ace_step_api.backends.engine import (
-    WORKER_SCRIPT,
     EngineConfig,
     EngineError,
     ResidentEngine,
@@ -26,6 +30,7 @@ from ace_step_api.backends.engine import (
 from ace_step_api.backends.process import PID_FILE
 from ace_step_api.checks import Level
 from ace_step_api.settings import SettingsError, load_settings
+from tests.fakes import acestep_checkout
 
 FAKE = Path(__file__).with_name("fake_acestep")
 
@@ -36,13 +41,13 @@ def fake_acestep(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FAKE_ACESTEP_MODE", "ok")
 
 
-def config(tmp_path: Path, **overrides: object) -> EngineConfig:
+def config(tmp_path: Path, mlx_dit: bool | None = None, **overrides: object) -> EngineConfig:
     values: dict[str, object] = {
+        "name": "acestep",
         "python": Path(sys.executable),
-        "project_root": tmp_path,
-        "dit_model": "acestep-v15-turbo",
-        "lm_model": "acestep-5Hz-lm-1.7B",
-        "lm_backend": "vllm",
+        "script": WORKER_SCRIPT,
+        "args": acestep_args(tmp_path, "acestep-v15-turbo", "acestep-5Hz-lm-1.7B", "vllm", mlx_dit),
+        "cwd": tmp_path,
         "state_dir": tmp_path / "state",
         "idle_seconds": 60.0,
         "poll_seconds": 0.05,
@@ -295,29 +300,17 @@ def test_a_leftover_worker_is_reaped(tmp_path: Path) -> None:
 # -- backend ---------------------------------------------------------------------------------
 
 
-def checkout(tmp_path: Path, models: tuple[str, ...] | None = None) -> Path:
-    root = tmp_path / "ACE-Step"
-    (root / "acestep").mkdir(parents=True)
-    (root / ".venv" / "bin").mkdir(parents=True)
-    # a wrapper, not a symlink: the venv is found from the path the interpreter runs as
-    python = root / ".venv" / "bin" / "python"
-    python.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-    python.chmod(0o755)
-    names = models or ("acestep-v15-turbo", "vae", "Qwen3-Embedding-0.6B", "acestep-5Hz-lm-1.7B")
-    for name in names:
-        (root / "checkpoints" / name).mkdir(parents=True)
-        (root / "checkpoints" / name / "model.safetensors").write_bytes(b"x")
-    return root
-
-
 def backend_for(tmp_path: Path, **options: object) -> AceStepBackend:
-    opts = AceStepOptions.model_validate({"project_root": str(checkout(tmp_path))} | options)
+    opts = AceStepOptions.model_validate(
+        {"project_root": str(acestep_checkout(tmp_path))} | options
+    )
     return AceStepBackend(opts, state_dir=tmp_path / "engine", poll_seconds=0.05)
 
 
 def request(**overrides: object) -> GenerationRequest:
     values: dict[str, object] = {
         "job_id": "job_1",
+        "engine": "acestep",
         "prompt": "J-pop",
         "lyrics": "[verse]\nla",
         "instrumental": False,
@@ -381,6 +374,7 @@ def test_backend_without_a_checkout(tmp_path: Path) -> None:
     backend = AceStepBackend(state_dir=tmp_path)
     raw = backend.generate(request(), tmp_path / "job", timeout_s=5, cancel=threading.Event())
     assert raw.failure_code == "backend_unavailable"
+    assert raw.failure == "not configured (set project_root in [backends.acestep])"
     assert [c.level for c in backend.health()] == [Level.FAIL]
 
 
@@ -388,19 +382,26 @@ def test_backend_health(tmp_path: Path) -> None:
     backend = backend_for(tmp_path)
     checks = {c.name: c for c in backend.health()}
     assert all(c.level is Level.OK for c in checks.values()), checks
-    assert "models stay loaded 120 s" in checks["resident engine"].detail
+    assert "models stay loaded 120 s" in checks["ACE-Step resident engine"].detail
+    assert backend.unavailable_reason() is None and backend.engine_status("acestep").available
     root = tmp_path / "ACE-Step"
     (root / "checkpoints" / "vae" / "model.safetensors").unlink()
     (root / ".venv" / "bin" / "python").unlink()
     checks = {c.name: c for c in backend.health()}
     assert checks["ACE-Step models"].failed and "vae" in checks["ACE-Step models"].detail
     assert checks["ACE-Step Python"].failed
+    assert backend.unavailable_reason() == (
+        "the ACE-Step Python is missing (run `uv sync` in the checkout)"
+    )
+    (root / ".venv" / "bin" / "python").symlink_to(sys.executable)
+    assert backend.unavailable_reason() == "model files missing: vae"
     off = backend_for(tmp_path / "off", resident_idle_seconds=0)
-    assert "off" in {c.name: c for c in off.health()}["resident engine"].detail
+    assert "off" in {c.name: c for c in off.health()}["ACE-Step resident engine"].detail
     other = AceStepBackend(
         AceStepOptions(project_root=tmp_path / "missing"), state_dir=tmp_path / "s"
     )
     assert {c.name: c for c in other.health()}["ACE-Step checkout"].failed
+    assert other.unavailable_reason() == "the ACE-Step checkout is missing"
 
 
 def test_worker_env_never_downloads(tmp_path: Path) -> None:
@@ -529,4 +530,4 @@ def test_the_mlx_switch_reaches_the_engine(
         "use_mlx_dit": seen,
     }
     backend = backend_for(tmp_path / "b", mlx_dit=mlx_dit)
-    assert backend.engine.config.mlx_dit is mlx_dit
+    assert backend.engine.config.args[8:] == tuple(flag)

@@ -5,13 +5,15 @@ build-backend = "hatchling.build"
 [project]
 name = "ace-step-api"
 version = "0.1.0"
-description = "Make music with ACE-Step 1.5 on an Apple Silicon Mac as an HTTP job API"
+description = "Make music with ACE-Step 1.5 or MiniMax Music 3 on an Apple Silicon Mac as an HTTP job API"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [{ name = "kabatin" }]
-keywords = ["ace-step", "music-generation", "apple-silicon", "text-to-music", "fastapi"]
+keywords = [
+  "ace-step", "minimax-music3", "music-generation", "apple-silicon", "text-to-music", "fastapi",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Framework :: FastAPI",
@@ -39,7 +41,7 @@ dev = [
   "ruff>=0.6",
   "pyright>=1.1.380",
   "httpx2>=2.13.1",
-  "numpy>=1.26",  # the worker's limiter, run in tests against tests/fake_acestep
+  "numpy>=1.26",  # the workers' level handling, run in tests against the fake engines
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -59,8 +61,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["S101", "S104", "S105", "S106", "S108", "PTH"]
-# the fake engine prints to stdout on purpose: the worker must keep it off the protocol
+# the fake engines print to stdout on purpose: the workers must keep it off the protocol
 "tests/fake_acestep/**" = ["T201"]
+"tests/fake_mlx_audio/**" = ["T201"]
 
 [tool.pyright]
 include = ["src"]
@@ -68,13 +71,13 @@ typeCheckingMode = "standard"
 pythonVersion = "3.12"
 
 [tool.coverage.run]
-# runs in the ACE-Step checkout's Python as a child process; tests/test_engine.py drives it
-# end to end against tests/fake_acestep
-omit = ["*/acestep_worker.py"]
+# the workers run in the engines' own Pythons as child processes; tests/test_engine.py and
+# tests/test_minimax.py drive them end to end against tests/fake_acestep and tests/fake_mlx_audio
+omit = ["*/acestep_worker.py", "*/minimax_worker.py"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q --cov=ace_step_api --cov-report=term-missing --cov-fail-under=80"
 markers = [
-  "real: runs a real ACE-Step generation (opt-in: ACE_STEP_API_REAL_TESTS=1)",
+  "real: runs a real engine generation (opt-in: ACE_STEP_API_REAL_TESTS=1)",
 ]

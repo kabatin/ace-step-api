@@ -11,8 +11,17 @@ from ace_step_api.jobs.models import JobError, JobStatus
 from ace_step_api.jobs.queue import JobView
 
 
+class WorkflowHealth(BaseModel):
+    available: bool = Field(description="its engine is installed with its models: jobs accepted")
+    loaded: bool = Field(
+        description="its models are in memory now (false while idle is normal: the next job "
+        "loads them)"
+    )
+    reason: str | None = Field(default=None, description="why it is not available")
+
+
 class HealthResponse(BaseModel):
-    """Same shape as vpipe-api's and wan-api's ``/v1/health``."""
+    """Same shape as vpipe-api's and wan-api's ``/v1/health``, plus ``workflows``."""
 
     status: str
     version: str
@@ -23,6 +32,9 @@ class HealthResponse(BaseModel):
         default=0,
         description="queued jobs held back while another GPU server is busy (not in `waiting`, "
         "so servers that wait for this one go first)",
+    )
+    workflows: dict[str, WorkflowHealth] = Field(
+        default_factory=dict, description="per workflow: can it take jobs, are its models loaded"
     )
 
 

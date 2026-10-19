@@ -58,20 +58,24 @@ def cmd_serve(settings: Settings, args: argparse.Namespace) -> int:
     os.umask(0o077)
     _raise_open_file_limit()
     backend = build_backend(settings)
-    problems = [check for check in backend.health() if check.failed]
-    if problems:
-        _err(f"error: the {backend.name} backend cannot generate:")
-        for check in problems:
-            _err(f"  ✗ {check.name}: {check.detail}")
+    registry = build_registry(backend)
+    engines = sorted({w.engine for w in registry if w.engine is not None})
+    statuses = {name: backend.engine_status(name) for name in engines}
+    if not any(status.available for status in statuses.values()):
+        _err("error: no engine can generate:")
+        for name, status in statuses.items():
+            _err(f"  ✗ {name}: {status.reason}")
         _err("run `ace-step-api doctor` for details")
         return 1
+    for name, status in statuses.items():
+        if not status.available:  # its workflow answers 503 workflow_unavailable
+            _err(f"warning: engine {name} is unavailable: {status.reason}")
     store = JobStore(settings.data_dir)
     try:
         store.acquire_instance_lock()
     except StoreLockedError as exc:
         _err(f"error: {exc}")
         return 1
-    registry = build_registry(backend)
     coordinator = Coordinator(
         settings.coordinate_with,
         settle_seconds=settings.settle_seconds,
@@ -96,11 +100,12 @@ def cmd_serve(settings: Settings, args: argparse.Namespace) -> int:
         token=token,
         max_body_bytes=settings.max_body_mb << 20,
         waits_for=coordinator.names,
+        engine_status=backend.engine_status,
     )
     waits = ", ".join(coordinator.names) or "nothing"
     _out(
         f"ace-step-api {__version__} on http://{settings.host}:{settings.port} "
-        f"(auth: {'bearer' if token else 'none, loopback only'}, backend: {backend.name}, "
+        f"(auth: {'bearer' if token else 'none, loopback only'}, "
         f"workflows: {', '.join(w.id for w in registry)}, "
         f"queue: 1 running + {settings.max_waiting} waiting, waits for: {waits})"
     )
@@ -143,8 +148,11 @@ def cmd_doctor(settings: Settings, args: argparse.Namespace) -> int:
 def cmd_workflows(settings: Settings, _: argparse.Namespace) -> int:
     backend = build_backend(settings)
     for workflow in build_registry(backend):
+        engine = workflow.engine or "-"
+        status = backend.engine_status(engine)
+        state = "available" if status.available else f"unavailable: {status.reason}"
         _out(f"{workflow.id}\n  {workflow.description}")
-        _out(f"  engine: {backend.name}")
+        _out(f"  engine: {engine} ({state})")
     return 0
 
 

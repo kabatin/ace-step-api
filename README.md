@@ -1,14 +1,18 @@
 # ace-step-api
 
-**Make music with ACE-Step 1.5 on your Apple Silicon Mac, as an HTTP job API.**
+**Make music with ACE-Step 1.5 or MiniMax Music 3 on your Apple Silicon Mac, as an HTTP job API.**
 
-`ace-step-api` is a small, safe job server around [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5).
-Send style tags, lyrics (or none) and a length, get back 1–4 WAV tracks:
+`ace-step-api` is a small, safe job server around two music engines:
+[ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) (workflow `ace-step-1.5`) and
+[MiniMax Music 3](https://huggingface.co/MiniMaxAI/MiniMax-Music3) through
+[mlx-audio](https://github.com/Blaizzy/mlx-audio) (workflow `minimax-music3`). Both take the same body:
+send style tags, lyrics (or none) and a length, get back 1–4 WAV tracks:
 
 ```
-POST /v1/workflows/ace-step-1.5/jobs   → 202 {id}
-GET  /v1/jobs/{id}                      → queued → running (progress) → succeeded
-GET  /v1/jobs/{id}/output?index=N       → audio/wav
+POST /v1/workflows/ace-step-1.5/jobs     → 202 {id}
+POST /v1/workflows/minimax-music3/jobs   → 202 {id}
+GET  /v1/jobs/{id}                        → queued → running (progress) → succeeded
+GET  /v1/jobs/{id}/output?index=N         → audio/wav
 ```
 
 It speaks the same job protocol as [klein-api](https://github.com/kabatin/klein-api),
@@ -18,26 +22,37 @@ needs only a different workflow id, body and output type. The full contract is [
 
 - **Closed workflow.** Clients send `prompt` (style tags), `lyrics`, `duration_sec`, `instrumental`, a
   seed and a count — never model names, steps, shift, BPM overrides or paths.
-- **Checked output.** Every track is a 16-bit PCM stereo WAV (48 kHz), peak-limited to −1 dBFS, read back
-  before the job succeeds; the result reports each track's real length.
+- **Checked output.** Every track is a 16-bit PCM stereo WAV (ACE-Step 48 kHz, MiniMax 44.1 kHz), kept
+  under −1 dBFS, read back before the job succeeds; the result reports each track's real length.
+- **Two engines, one queue.** Each workflow names its engine; jobs of both share the one GPU slot, and
+  only one engine is in memory at a time (the other is unloaded before a job starts). If one engine is
+  not installed, its workflow answers `503 workflow_unavailable` and `/v1/health` says why; the other
+  keeps working. The server starts when at least one engine is available.
 - **One GPU slot, honest backpressure.** One job at a time (its tracks run one after another), a small
   waiting queue, `429 busy` with `Retry-After` when full.
 - **Plays nicely with other GPU servers.** With `coordinate_with`, a job starts only once vpipe-api /
   klein-api report idle (and not before `settle_seconds` after one was last seen busy). While waiting it
   yields, so klein-api — which can wait for ace-step-api in turn — goes first instead of deadlocking.
 - **No needless model loads.** The models stay loaded in a resident worker between jobs and are released
-  when idle (120 s) or as soon as another GPU server is busy: ACE-Step holds ~19 GB of unified memory.
+  when idle (120 s), when the other engine takes the GPU, or as soon as another GPU server is busy:
+  ACE-Step holds ~19 GB of unified memory, MiniMax Music 3 ~24 GB.
 - **Restart-safe.** Jobs live on disk; queued jobs run again, interrupted ones fail as retryable, and a
   worker left behind by a crashed server is stopped.
 
 **The same seed does not reproduce a track.** ACE-Step's language model samples the song plan, so two
-runs with identical inputs differ. Make a few takes and pick one.
+runs with identical inputs differ. Make a few takes and pick one. (Whether MiniMax Music 3 repeats a
+track for the same seed has not been checked.)
+
+**MiniMax Music 3 is slow.** It runs ~9 s per second of audio on the target Mac (a 60 s track ≈ 10
+minutes, a 240 s track over half an hour) and peaks at ~24 GB. Its `duration_sec` is an upper bound:
+the model may end a song early (a 62 s request once gave 22.9 s); the result reports the real length.
 
 ## Requirements
 
-- Apple Silicon Mac, macOS 14+, 32 GB of memory recommended (a loaded engine peaks at ~19 GB).
+- Apple Silicon Mac, macOS 14+, 32 GB of memory recommended (a loaded engine peaks at ~19 GB ACE-Step,
+  ~24 GB MiniMax Music 3; only one is loaded at a time).
 - Python 3.12+ and [uv](https://docs.astral.sh/uv/) for ace-step-api itself.
-- An [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) checkout with its own environment
+- For `ace-step-1.5`: an [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) checkout with its own environment
   (`uv sync` there: Python 3.11–3.12, PyTorch, MLX) and these models in its `checkpoints/`
   (the `ACE-Step/Ace-Step1.5` repository on Hugging Face, ~10 GB):
 
@@ -48,7 +63,14 @@ runs with identical inputs differ. Make a few takes and pick one.
 | `Qwen3-Embedding-0.6B` | text encoder | 1.2 GB |
 | `vae` | audio decoder | 0.3 GB |
 
-ace-step-api runs that checkout's Python as a separate worker process; the two environments never mix.
+- For `minimax-music3`: a virtual environment with [mlx-audio](https://github.com/Blaizzy/mlx-audio)
+  0.5.9+ (MiniMax Music 3 support; Python 3.12, MLX 0.32) and the `mlx-community/MiniMax-Music3-mxfp8`
+  weights (~13 GB: three shards, the tokenizer, the config) in a Hugging Face cache.
+
+ace-step-api runs each engine's Python as a separate worker process; the environments never mix.
+Either engine is optional: a workflow whose engine is missing is reported unavailable and the other
+keeps working. `doctor` shows the missing engine's checks as warnings while another engine is
+available, and fails (exit 1) only when no engine can generate.
 
 ### Measurements
 
@@ -72,10 +94,24 @@ The port's own MLX path for the language model fails to load its checkpoint with
 resolves (`Received 310 parameters not in model`) and falls back to PyTorch; `lm_backend = "pt"`
 skips that attempt.
 
+**MiniMax Music 3** (`mlx-community/MiniMax-Music3-mxfp8`, mlx-audio 0.5.9, MLX 0.32.4, 30 steps,
+same Mac). **Measured outside this server** (mlx-audio's Python API directly), not yet through it:
+
+| track asked | compute | per second of audio | notes |
+|---|---|---|---|
+| 15 s | 125 s | 8.3 s | |
+| 62 s | 584 s | 9.4 s | |
+| 62 s | — | — | once ended at 22.9 s (the length is an upper bound) |
+
+`load()` returned in ~2.7 s; the first generation also pays for paging the weights in. Peak memory
+~24 GB. The server's estimate is `30 s (load) + (10 + 9.5 × duration) s` per track — ~10 minutes for
+60 s, ~38 minutes for 240 s. Lengths beyond 62 s were not measured; if the cost grows faster than
+linearly, the default `job_timeout_factor` still leaves room (see *Configuration*).
+
 ## Setup on the Mac
 
 ```sh
-# 1. the engine (anywhere; this is the layout the examples use). Either checkout works, see
+# 1. ACE-Step (anywhere; this is the layout the examples use). Either checkout works, see
 #    "Measurements": the official one is maintained and pinned, the port was 2x faster here.
 mkdir -p ~/.local/opt/ace-step && cd ~/.local/opt/ace-step
 git clone https://github.com/ace-step/ACE-Step-1.5 && cd ACE-Step-1.5
@@ -83,7 +119,12 @@ git clone https://github.com/ace-step/ACE-Step-1.5 && cd ACE-Step-1.5
 uv sync                   # the port has no uv.lock: the first sync writes one, keep it
 HF_HUB_DISABLE_XET=1 uv run python -c 'from acestep.model_downloader import download_main_model; print(download_main_model(prefer_source="huggingface"))'
 
-# 2. the server
+# 2. MiniMax Music 3 (the defaults of [backends.minimax] point here)
+uv venv --python 3.12 ~/.local/opt/minimax-music3/.venv
+uv pip install --python ~/.local/opt/minimax-music3/.venv/bin/python "mlx-audio>=0.5.9"
+HF_HOME=~/.local/share/minimax-music3/hf ~/.local/opt/minimax-music3/.venv/bin/hf download mlx-community/MiniMax-Music3-mxfp8
+
+# 3. the server
 uv tool install git+https://github.com/kabatin/ace-step-api
 ```
 
@@ -102,6 +143,11 @@ project_root = "~/.local/opt/ace-step/ace-step-apple-silicon"   # or …/ACE-Ste
 lm_backend = "pt"                                               # "mlx" for the official checkout
 hf_home = "~/.local/share/ace-step-api/hf"   # keep the worker's Hugging Face caches apart
 
+# optional: the defaults match step 2 above
+[backends.minimax]
+python = "~/.local/opt/minimax-music3/.venv/bin/python"
+hf_home = "~/.local/share/minimax-music3/hf"
+
 # wait for the other GPU servers on this Mac before each job
 [[coordinate_with]]
 name = "vpipe-api"
@@ -117,9 +163,11 @@ token = "…klein-api's bearer token…"
 ### `doctor`
 
 ```sh
-ace-step-api doctor           # platform, macOS, Python, config permissions, checkout, engine Python,
+ace-step-api doctor           # platform, macOS, Python, config permissions, each engine's install and
                               # models, disk, power, memory, and every coordinate_with server
-ace-step-api doctor --smoke   # + one real 10-second track through the workflow (stop the server first)
+ace-step-api doctor --smoke   # + one real 10-second instrumental per available workflow, one after the
+                              # other (stop the server first; ~1 min ACE-Step, ~2–3 min MiniMax)
+ace-step-api workflows        # each workflow, its engine, and whether that engine is available
 ```
 
 ### `serve`
@@ -128,7 +176,9 @@ ace-step-api doctor --smoke   # + one real 10-second track through the workflow 
 ace-step-api serve            # http://127.0.0.1:8768   (OpenAPI: /openapi.json, docs: /docs)
 ```
 
-`serve` checks the checkout and the models first and exits with a clear message if it cannot generate.
+`serve` checks each engine's install and models first. It exits with a clear message if no engine can
+generate, and starts with a warning when only one can (the other workflow answers
+`503 workflow_unavailable`).
 
 ### Run at login (launchd)
 
@@ -141,8 +191,9 @@ launchctl bootout gui/$(id -u)/com.github.kabatin.ace-step-api                # 
 ```
 
 Logs are JSON lines on stderr (job id, state transitions, queue/coordination/backend/postprocess/total
-seconds, model loads, failure category) — never prompts, lyrics, audio or tokens. The engine worker's own
-output goes to `data_dir/engine/worker.log`.
+seconds, model loads, failure category) — never prompts, lyrics, audio or tokens. The engine workers' own
+output goes to `data_dir/engine/worker.log` (ACE-Step) and `data_dir/engine/minimax/worker.log`
+(MiniMax Music 3).
 
 ## Configuration
 
@@ -155,8 +206,8 @@ output goes to `data_dir/engine/worker.log`.
 | `token` | — | when set, every request needs `Authorization: Bearer <token>` (≥ 32 printable ASCII) |
 | `max_waiting` | `2` | jobs allowed to wait behind the running one |
 | `retention_days` | `7` | finished jobs and outputs are deleted after this |
-| `data_dir` | `~/.local/share/ace-step-api` | `jobs/<id>/` (record, outputs), `engine/` (worker log, pid) |
-| `job_timeout_factor` | `3.0` | a job is stopped after `estimate × factor + 5 min` |
+| `data_dir` | `~/.local/share/ace-step-api` | `jobs/<id>/` (record, outputs), `engine/` (ACE-Step worker log, pid), `engine/minimax/` (MiniMax's) |
+| `job_timeout_factor` | `3.0` | a job is stopped after `estimate × factor + 5 min` (see below) |
 | `max_body_mb` | `64` | request size limit |
 | `coordinate_with` | `[]` | `[[coordinate_with]]` tables: `name`, `health_url`, optional `token` (file only) |
 | `settle_seconds` | `30` | after a coordinated server was seen busy, a job starts no sooner than this |
@@ -177,6 +228,28 @@ output goes to `data_dir/engine/worker.log`.
 | `stop_grace_s` | `15` | Ctrl-C grace before SIGKILL |
 | `load_seconds`, `track_overhead_seconds`, `seconds_per_audio_second` | measured | estimate model (`load + (overhead + rate × duration) × count`) |
 
+`[backends.minimax]` (every key optional):
+
+| key | default | |
+|---|---|---|
+| `python` | `~/.local/opt/minimax-music3/.venv/bin/python` | a venv Python with mlx-audio (MiniMax Music 3 support) |
+| `hf_home` | `~/.local/share/minimax-music3/hf` | `HF_HOME` holding the weights (the worker runs offline) |
+| `model` | `mlx-community/MiniMax-Music3-mxfp8` | Hugging Face repo id in that cache |
+| `resident_idle_seconds` | `120` | keep the model loaded this long after a job (`0`: load per job) |
+| `start_timeout_s` | `300` | give up loading after this |
+| `stop_grace_s` | `15` | Ctrl-C grace before SIGKILL |
+| `load_seconds` / `track_overhead_seconds` / `seconds_per_audio_second` | `30` / `10` / `9.5` | estimate model, as above |
+
+The MiniMax workflow is available when that Python exists, the venv has mlx-audio's MiniMax Music 3
+package, and the cache holds the repo's `config.json`, `tokenizer/` and every weight shard its index
+names. A missing piece makes `minimax-music3` unavailable with the reason in `/v1/health`; ACE-Step is
+unaffected (and vice versa).
+
+**Job timeouts.** A job is stopped after `estimate × job_timeout_factor + 300 s`. The longest MiniMax
+job (4 × 240 s) is estimated at 30 + 4 × (10 + 9.5 × 240) = 9190 s (~2.6 h); with the default factor 3
+it is stopped only after ~7.7 h — at the worst measured rate (9.4 s/s) it needs ~2.5 h. At factor 1
+the only margin is the 300 s, so keep the default (or ≥ 1.5) when MiniMax is used for long tracks.
+
 ### Coordination with other GPU servers
 
 When `coordinate_with` is set, the job at the head of the queue starts only after a check in which
@@ -194,18 +267,31 @@ counts only its own `vpipe --launch` processes, so it never waits for ace-step-a
 
 ### Resident engine
 
-The first job starts the worker (`<python> -P acestep_worker.py …` in the checkout, its own process
-group, stdin for requests and a private pipe for replies, so the engine's progress bars on stdout can
-never corrupt the protocol). It loads the DiT, VAE, text encoder and language model once; later jobs
-reuse them. The worker is stopped:
+The first job of an engine starts its worker (`<python> -P acestep_worker.py …` in the ACE-Step
+checkout, `<python> -P minimax_worker.py --model …` for MiniMax; each in its own process group, stdin
+for requests and a private pipe for replies, so the engine's progress bars on stdout can never corrupt
+the protocol). It loads the models once; later jobs reuse them. A worker is stopped:
 
 - after `resident_idle_seconds` (120) without a job;
+- before a job of the other engine starts: the two engines never share the memory (~19 + ~24 GB would
+  not fit a 32 GB Mac);
 - immediately when a `coordinate_with` server is seen busy while it idles (checked every
-  `coordination_poll_seconds`) — this gives the ~19 GB back to vpipe-api or klein-api;
+  `coordination_poll_seconds`) — this gives the memory back to vpipe-api or klein-api;
 - after a job that did not succeed (canceled, timed out, failed), and on shutdown.
 
 A worker left behind by a crashed ace-step-api is stopped at the next start (pid file in
-`data_dir/engine/`, matched by pid, script name and start time).
+`data_dir/engine/` for ACE-Step — where 0.1.0 kept it — and `data_dir/engine/minimax/`, matched by
+pid, script name and start time).
+
+MiniMax Music 3 reports no progress while it generates, so its job `progress` is an estimate: time
+spent over the track's expected time, at most 0.95 per track until the track is done. Long tracks may
+run past the (uncalibrated, linear) estimate; progress then holds at 0.95 until the track finishes.
+
+After every MiniMax track the worker releases MLX's buffer cache, so an idle worker keeps only the
+model. Input the engine refuses (prompt + lyrics over 5000 tokens, a model that makes no audio) fails
+the job as `invalid_params`, not retryable, and keeps the worker loaded. A worker that survives SIGKILL
+(stuck in the GPU driver) blocks every load, of either engine, until it exits: such jobs fail as
+`engine_unstoppable`.
 
 ### Output
 
@@ -222,6 +308,10 @@ Audio that stays under the ceiling is left untouched; loudness is not normalised
 this, peaks above full scale were clipped for good (up to ~1000 clipped samples in a 60-second
 instrumental). Measured: gain −0.4 … −3.5 dB, limiter −0.7 … −2.1 dB on 60 s tracks; the official
 checkout normalises its own output to −1 dBFS, so there both stay at 0. Each track's values are in
+`result.details.generation.engine.tracks[]`.
+
+MiniMax Music 3 clips its own float output to [−1, 1]. If a track peaks above −1 dBFS, the whole track is
+turned down to −1 dBFS (one gain, no limiter: the waveform keeps its shape); `gain_db` per track is in
 `result.details.generation.engine.tracks[]`.
 
 ## API examples
@@ -242,6 +332,12 @@ curl -s "${AUTH[@]}" "$API/v1/jobs/$JOB" | jq '{status, progress, queue_position
 curl -s "${AUTH[@]}" -o take-0.wav "$API/v1/jobs/$JOB/output?index=0"
 curl -s "${AUTH[@]}" -o take-1.wav "$API/v1/jobs/$JOB/output?index=1"
 curl -s "${AUTH[@]}" -X DELETE "$API/v1/jobs/$JOB"          # cancel (200 canceled / 202 stopping)
+
+# the same body on MiniMax Music 3 (no lyrics: an instrumental; ~10 minutes per 60 s track)
+curl -s "${AUTH[@]}" -X POST "$API/v1/workflows/minimax-music3/jobs" \
+     -H 'Content-Type: application/json' \
+     -d '{"prompt": "warm acoustic pop, 96 BPM, soft piano and guitar", "instrumental": true, "duration_sec": 60}'
+curl -s "${AUTH[@]}" "$API/v1/health" | jq .workflows    # available / loaded / reason per workflow
 ```
 
 ## Security
@@ -254,8 +350,8 @@ curl -s "${AUTH[@]}" -X DELETE "$API/v1/jobs/$JOB"          # cancel (200 cancel
   others.
 - Body limit (`max_body_mb`; any `Transfer-Encoding` is refused with 411), at most 64 concurrent
   connections, control characters refused in prompts and lyrics, strict job ids, no client-chosen paths,
-  models or settings. The engine worker runs without a shell and without ace-step-api's environment (the
-  token), offline (`HF_HUB_OFFLINE=1`), and receives prompts as JSON on a pipe. Client-facing errors never
+  models or settings. The engine workers run without a shell and without ace-step-api's environment (the
+  token), offline (`HF_HUB_OFFLINE=1`), and receive prompts as JSON on a pipe. Client-facing errors never
   contain paths or internals. Job files are private to the server's user (umask 077). Do not add CORS:
   the API relies on browsers not being able to send cross-site JSON.
 
@@ -273,19 +369,45 @@ different track every time.
 Not checked: 44.1 kHz output (the engine always produced 48 kHz), `count` 3–4 in one job, durations
 between 60 and 240 s other than those two, the official checkout's 240 s time.
 
+**MiniMax Music 3 through this server: not yet verified on the real engine.** The worker, the router
+(unloading ACE-Step first), availability checks and the workflow are covered by tests against a fake
+`mlx_audio`; on the target Mac, `ace-step-api workflows` with the server's configuration reports both
+engines available (install and weights found), and the worker's array conversion and WAV writing were
+run in the MiniMax venv on a tiny array (CPU; the model was not loaded). Still to
+check with `doctor --smoke` / the real-engine test: a full generation, its time and memory through the
+server, the first-generation load cost, how often the progress estimate updates while MLX computes, a
+240 s track, and seed reproducibility.
+
 ## Development
 
 ```sh
 uv sync
-uv run pytest            # fake engine (tests/fake_acestep); 80%+ coverage gate; `real` tests are skipped
+uv run pytest            # fake engines (tests/fake_acestep, tests/fake_mlx_audio); 80%+ coverage gate;
+                         # `real` tests are skipped
 uv run ruff check && uv run ruff format --check && uv run pyright
 ACE_STEP_API_REAL_TESTS=1 uv run pytest -m real --no-cov   # on the Mac with the engine installed
 ```
 
-`tests/test_engine.py` runs the real worker script in a child process against a fake `acestep` package,
-so the protocol, cancel/timeout, crashes, idle release and the limiter are covered without a GPU.
+`tests/test_engine.py` and `tests/test_minimax.py` run the real worker scripts in child processes
+against a fake `acestep` package and a fake `mlx_audio`, so the protocol, cancel/timeout, crashes, idle
+release, the limiter and MiniMax's shape/level handling are covered without a GPU;
+`tests/test_router.py` runs both together (one engine in memory at a time).
 
 ## License
 
-Apache-2.0 (this repository; it ships no weights and no ACE-Step code). ACE-Step 1.5's code and the
+Apache-2.0 (this repository; it ships no weights and no engine code). ACE-Step 1.5's code and the
 `ACE-Step/Ace-Step1.5` weights are MIT-licensed; check the license of every model you use.
+
+**MiniMax Music 3** weights (and the `mlx-community` conversion) are under the
+[MiniMax-Music3 Community License](https://huggingface.co/MiniMaxAI/MiniMax-Music3/blob/main/LICENSE).
+In short (read the licence itself):
+
+- commercial use is allowed;
+- a commercial product or service that uses it must **prominently display "MiniMax-Music3" in its
+  user interface** (`/v1/capabilities` gives it as the workflow's `attribution`);
+- above US$20 million aggregate yearly revenue (with affiliates), a separate prior written
+  authorisation from MiniMax is needed;
+- offering generation to third parties (a product, service or hosted service) requires reasonable
+  safeguards against uses and outputs that violate the licence, e.g. infringing third-party rights;
+- the acceptable-use policy (Exhibit A) forbids, among others, infringing uses, and asks that content
+  published to a public environment be clearly and prominently disclosed as machine-generated.

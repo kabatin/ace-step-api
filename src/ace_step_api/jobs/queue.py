@@ -542,8 +542,10 @@ class JobQueue:
         if not raw.ok:
             code = "timeout" if raw.timed_out else raw.failure_code
             message = redact(raw.describe_failure())
+            retryable = raw.retryable
             self._finish(
-                record.id, lambda r: r.failed(code, message, retryable=True, timings=timings)
+                record.id,
+                lambda r: r.failed(code, message, retryable=retryable, timings=timings),
             )
             return
         started = time.monotonic()

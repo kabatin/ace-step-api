@@ -3,15 +3,20 @@
 from __future__ import annotations
 
 from ace_step_api.backends.base import MusicBackend
-from ace_step_api.workflows.ace_step import AceStepWorkflow
-from ace_step_api.workflows.base import Workflow, WorkflowRegistry
+from ace_step_api.workflows import ace_step, minimax
+from ace_step_api.workflows.base import WorkflowRegistry
 
 
 def build_registry(backend: MusicBackend) -> WorkflowRegistry:
-    workflows: list[Workflow] = [
-        AceStepWorkflow(typical_seconds_60s=backend.typical_seconds(60.0)),
-    ]
-    return WorkflowRegistry(workflows)
+    def typical_60s(engine: str) -> float:
+        return backend.typical_seconds_for(engine, 60.0)
+
+    return WorkflowRegistry(
+        [
+            ace_step.AceStepWorkflow(typical_seconds_60s=typical_60s(ace_step.ENGINE)),
+            minimax.MiniMaxMusic3Workflow(typical_seconds_60s=typical_60s(minimax.ENGINE)),
+        ]
+    )
 
 
 __all__ = ["WorkflowRegistry", "build_registry"]

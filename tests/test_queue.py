@@ -100,6 +100,31 @@ def test_failures_are_recorded(
         queue.output_path(record.id)
 
 
+def test_an_unstoppable_engine_fails_the_job_and_the_server_carries_on(
+    queue: JobQueue, backend: FakeMusicBackend
+) -> None:
+    backend.mode = "unstoppable"
+    record, _ = queue.submit(EchoWorkflow(), EchoParams(text="x"))
+    wait_for(lambda: status(queue, record.id) is JobStatus.FAILED)
+    error = queue.view(record.id).record.error
+    assert error is not None and (error.code, error.retryable) == ("engine_unstoppable", True)
+    assert queue.worker_alive
+    backend.mode = "ok"
+    after, _ = queue.submit(EchoWorkflow(), EchoParams(text="y"))
+    wait_for(lambda: status(queue, after.id) is JobStatus.SUCCEEDED)
+
+
+def test_input_the_engine_rejects_is_not_retryable(
+    queue: JobQueue, backend: FakeMusicBackend
+) -> None:
+    backend.mode = "rejected"
+    record, _ = queue.submit(EchoWorkflow(), EchoParams(text="x"))
+    wait_for(lambda: status(queue, record.id) is JobStatus.FAILED)
+    error = queue.view(record.id).record.error
+    assert error is not None and (error.code, error.retryable) == ("invalid_params", False)
+    assert "rejected the input" in error.message
+
+
 def test_workflow_failure_keeps_its_code(queue: JobQueue) -> None:
     record, _ = queue.submit(EchoWorkflow(), EchoParams(text="x", fail_finalize=True))
     wait_for(lambda: status(queue, record.id) is JobStatus.FAILED)

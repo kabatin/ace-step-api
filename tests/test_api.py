@@ -6,14 +6,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from ace_step_api.api.app import create_app
+from ace_step_api.backends.base import EngineStatus
 from ace_step_api.jobs.queue import JobQueue
 from ace_step_api.jobs.store import JobStore
 from ace_step_api.workflows.ace_step import AceStepWorkflow
 from ace_step_api.workflows.base import WorkflowRegistry
+from ace_step_api.workflows.minimax import MiniMaxMusic3Workflow
 from tests.fakes import EchoWorkflow, FakeMusicBackend
 
 TOKEN = "test-token-0123456789-abcdefghijklmnop"
 MUSIC = "/v1/workflows/ace-step-1.5/jobs"
+MINIMAX = "/v1/workflows/minimax-music3/jobs"
 
 
 def make_client(
@@ -23,11 +26,18 @@ def make_client(
     max_body: int = 1 << 20,
     waits_for: list[str] | None = None,
 ) -> TestClient:
-    registry = WorkflowRegistry([EchoWorkflow(), AceStepWorkflow()])
+    registry = WorkflowRegistry([EchoWorkflow(), AceStepWorkflow(), MiniMaxMusic3Workflow()])
     queue = JobQueue(
         JobStore(tmp_path), registry, backend, max_waiting=1, timeout_factor=2, retention_days=7
     )
-    app = create_app(queue, registry, token=token, max_body_bytes=max_body, waits_for=waits_for)
+    app = create_app(
+        queue,
+        registry,
+        token=token,
+        max_body_bytes=max_body,
+        waits_for=waits_for,
+        engine_status=backend.engine_status,
+    )
     return TestClient(app, base_url="http://127.0.0.1")
 
 
@@ -61,9 +71,72 @@ def test_health_matches_vpipe_api_shape(client: TestClient) -> None:
         "waiting": 0,
         "max_waiting": 1,
         "waiting_for_peer": 0,
+        # additive: one entry per workflow that runs on an engine (echo has none)
+        "workflows": {
+            "ace-step-1.5": {"available": True, "loaded": False, "reason": None},
+            "minimax-music3": {"available": True, "loaded": False, "reason": None},
+        },
     }
     assert client.get("/v1/health").json() == expected
     assert client.get("/healthz").json() == expected
+
+
+def test_an_unavailable_workflow_is_refused_while_the_other_works(
+    client: TestClient, backend: FakeMusicBackend
+) -> None:
+    backend.statuses = {
+        "acestep": EngineStatus(available=True, loaded=True),
+        "minimax": EngineStatus(available=False, reason="mlx-community/x is not downloaded"),
+    }
+    health = client.get("/v1/health").json()
+    assert health["status"] == "ok"
+    assert health["workflows"] == {
+        "ace-step-1.5": {"available": True, "loaded": True, "reason": None},
+        "minimax-music3": {
+            "available": False,
+            "loaded": False,
+            "reason": "mlx-community/x is not downloaded",
+        },
+    }
+    refused = client.post(MINIMAX, json={"prompt": "lo-fi"})
+    assert refused.status_code == 503
+    assert refused.json()["error"] == {
+        "code": "workflow_unavailable",
+        "message": "minimax-music3 cannot run on this server: mlx-community/x is not downloaded",
+        "retryable": False,
+        "details": None,
+    }
+    assert client.post(MUSIC, json={"prompt": "lo-fi"}).status_code == 202
+    # and the other way round
+    backend.statuses = {"acestep": EngineStatus(available=False, reason="not configured")}
+    assert client.post(MUSIC, json={"prompt": "lo-fi"}).json()["error"]["code"] == (
+        "workflow_unavailable"
+    )
+    assert client.post(MINIMAX, json={"prompt": "lo-fi"}).status_code in (202, 429)
+    # a body that fails validation is still a 422, not a 503
+    assert client.post(MUSIC, json={"prompt": ""}).status_code == 422
+    # the reason never shows the server's home directory
+    backend.statuses = {"minimax": EngineStatus(available=False, reason="no /Users/someone/x")}
+    message = client.post(MINIMAX, json={"prompt": "x"}).json()["error"]["message"]
+    assert message == "minimax-music3 cannot run on this server: no ~/x"
+
+
+def test_a_minimax_job_end_to_end(tmp_path: Path) -> None:
+    backend = FakeMusicBackend(wav=True, seconds=0.5)
+    with make_client(tmp_path, backend) as c:
+        accepted = c.post(MINIMAX, json={"prompt": "warm acoustic pop", "seed": 9, "count": 2})
+        assert accepted.status_code == 202
+        done = poll(c, accepted.json()["id"], "succeeded")
+        assert done["workflow"] == "minimax-music3"
+        assert [o["sample_rate"] for o in done["result"]["outputs"]] == [44100, 44100]
+        assert [o["seed_used"] for o in done["result"]["outputs"]] == [9, 10]
+        generation = done["result"]["details"]["generation"]
+        assert generation["instrumental"] is True  # no lyrics: instrumental
+        assert "vocal_language" not in generation
+        wav = c.get(f"/v1/jobs/{done['id']}/output?index=1")
+        assert wav.status_code == 200 and wav.headers["content-type"] == "audio/wav"
+    call = backend.calls[0]
+    assert (call.engine, call.instrumental, call.lyrics, call.count) == ("minimax", True, "", 2)
 
 
 def test_capabilities_match_the_contract(tmp_path: Path, backend: FakeMusicBackend) -> None:
@@ -93,8 +166,22 @@ def test_capabilities_match_the_contract(tmp_path: Path, backend: FakeMusicBacke
         "instrumental": True,
         "typical_seconds": {"60s_track": 45},
     }
+    minimax = next(w for w in body["workflows"] if w["id"] == "minimax-music3")
+    assert minimax["output"]["sample_rates"] == [44100]
+    assert minimax["duration_sec"]["upper_bound"] is True
+    assert minimax["attribution"] == "MiniMax-Music3"
     text = str(body).lower()
-    for secret in ("safetensors", "steps", "shift", "turbo", "1.7b", "checkpoint", "mlx"):
+    for secret in (
+        "safetensors",
+        "steps",
+        "shift",
+        "turbo",
+        "1.7b",
+        "checkpoint",
+        "mlx",
+        "mxfp8",
+        "hugging",
+    ):
         assert secret not in text
 
 
@@ -104,7 +191,9 @@ def test_no_coordination_is_an_empty_list(client: TestClient) -> None:
 
 def test_workflows_and_openapi(client: TestClient) -> None:
     flows = {w["id"]: w for w in client.get("/v1/workflows").json()["workflows"]}
-    assert set(flows) == {"echo", "ace-step-1.5"}
+    assert set(flows) == {"echo", "ace-step-1.5", "minimax-music3"}
+    schemas = {name: flows[name]["params_schema"] for name in ("ace-step-1.5", "minimax-music3")}
+    assert schemas["minimax-music3"]["properties"] == schemas["ace-step-1.5"]["properties"]
     props = flows["ace-step-1.5"]["params_schema"]["properties"]
     assert set(props) == {"prompt", "lyrics", "duration_sec", "instrumental", "seed", "count"}
     assert flows["ace-step-1.5"]["output_media_type"] == "audio/wav"
@@ -112,7 +201,11 @@ def test_workflows_and_openapi(client: TestClient) -> None:
     route = spec["paths"][MUSIC]["post"]
     schema_ref = route["requestBody"]["content"]["application/json"]["schema"]["$ref"]
     assert schema_ref.endswith("AceStepParams")
-    assert {"422", "429"} <= set(route["responses"])
+    assert {"422", "429", "503"} <= set(route["responses"])
+    minimax = spec["paths"][MINIMAX]["post"]
+    assert minimax["requestBody"]["content"]["application/json"]["schema"]["$ref"].endswith(
+        "MiniMaxParams"
+    )
     assert client.get("/docs").status_code == 200
 
 

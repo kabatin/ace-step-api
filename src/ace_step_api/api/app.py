@@ -26,6 +26,7 @@ from ace_step_api.api.schemas import (
     JobAccepted,
     JobResponse,
     QueueCapacity,
+    WorkflowHealth,
     WorkflowInfo,
     WorkflowsResponse,
 )
@@ -37,6 +38,7 @@ from ace_step_api.api.security import (
     BusyGateMiddleware,
     LoopbackOnlyMiddleware,
 )
+from ace_step_api.backends.base import EngineStatus
 from ace_step_api.jobs.queue import (
     IdempotencyConflictError,
     InsufficientStorageError,
@@ -45,8 +47,12 @@ from ace_step_api.jobs.queue import (
     JobQueue,
     OutputIndexError,
     QueueFullError,
+    redact,
 )
 from ace_step_api.workflows.base import InvalidParamsError, Workflow, WorkflowRegistry
+
+# engine name -> can it take jobs, are its models loaded
+EngineStatusFn = Callable[[str], EngineStatus]
 
 _ERRORS: dict[int | str, dict[str, Any]] = {
     code: {"model": ErrorEnvelope} for code in (401, 403, 404, 409, 411, 413, 422, 429, 503)
@@ -57,8 +63,20 @@ def _not_found(what: str) -> JSONResponse:
     return error_response(404, "not_found", f"{what} not found")
 
 
-def _submit_endpoint(queue: JobQueue, workflow: Workflow) -> Callable[..., Any]:
+def _submit_endpoint(
+    queue: JobQueue, workflow: Workflow, engine_status: EngineStatusFn | None
+) -> Callable[..., Any]:
+    engine = workflow.engine
+
     def submit(params: BaseModel, idempotency_key: str | None = None) -> Any:
+        if engine is not None and engine_status is not None:
+            status = engine_status(engine)
+            if not status.available:
+                return error_response(
+                    503,
+                    "workflow_unavailable",
+                    redact(f"{workflow.id} cannot run on this server: {status.reason}"),
+                )
         try:
             record, created = queue.submit(workflow, params, idempotency_key)
         except QueueFullError as exc:
@@ -102,8 +120,27 @@ def _submit_endpoint(queue: JobQueue, workflow: Workflow) -> Callable[..., Any]:
     return submit
 
 
+def _workflow_health(
+    registry: WorkflowRegistry, engine_status: EngineStatusFn | None
+) -> dict[str, WorkflowHealth]:
+    report: dict[str, WorkflowHealth] = {}
+    if engine_status is None:
+        return report
+    for workflow in registry:
+        if workflow.engine is None:
+            continue
+        status = engine_status(workflow.engine)
+        report[workflow.id] = WorkflowHealth(
+            available=status.available, loaded=status.loaded, reason=status.reason
+        )
+    return report
+
+
 def build_router(
-    queue: JobQueue, registry: WorkflowRegistry, waits_for: list[str] | None = None
+    queue: JobQueue,
+    registry: WorkflowRegistry,
+    waits_for: list[str] | None = None,
+    engine_status: EngineStatusFn | None = None,
 ) -> APIRouter:
     router = APIRouter()
 
@@ -117,6 +154,7 @@ def build_router(
             waiting=waiting,
             max_waiting=queue.max_waiting,
             waiting_for_peer=waiting_for_peer,
+            workflows=_workflow_health(registry, engine_status),
         )
         # a dead worker means nothing will ever run: say so instead of looking healthy
         return body if alive else JSONResponse(status_code=503, content=body.model_dump())
@@ -156,7 +194,7 @@ def build_router(
     for workflow in registry:
         router.add_api_route(
             f"/v1/workflows/{workflow.id}/jobs",
-            _submit_endpoint(queue, workflow),
+            _submit_endpoint(queue, workflow, engine_status),
             methods=["POST"],
             status_code=202,
             response_model=JobAccepted,
@@ -226,6 +264,7 @@ def create_app(
     token: str | None,
     max_body_bytes: int,
     waits_for: list[str] | None = None,
+    engine_status: EngineStatusFn | None = None,
     manage_queue: bool = True,
 ) -> FastAPI:
     @asynccontextmanager
@@ -241,11 +280,11 @@ def create_app(
     app = FastAPI(
         title="ace-step-api",
         version=__version__,
-        summary="Make music with ACE-Step 1.5 as HTTP jobs",
+        summary="Make music with ACE-Step 1.5 or MiniMax Music 3 as HTTP jobs",
         lifespan=lifespan,
     )
     install_error_handlers(app)
-    app.include_router(build_router(queue, registry, waits_for))
+    app.include_router(build_router(queue, registry, waits_for, engine_status))
     # Starlette runs the last-added middleware first:
     # auth (or loopback-only without a token), size check, busy gate, route.
     app.add_middleware(BusyGateMiddleware, queue=queue)

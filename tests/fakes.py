@@ -1,7 +1,10 @@
-"""In-process stand-ins: a scriptable music backend and a trivial text workflow."""
+"""In-process stand-ins: a scriptable music backend and a trivial text workflow; on-disk
+stand-ins for the engines' installs (an ACE-Step checkout, the MiniMax runtime and weights)."""
 
 from __future__ import annotations
 
+import json
+import sys
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
@@ -10,6 +13,7 @@ from typing import Any, ClassVar, cast
 from pydantic import BaseModel, ConfigDict, Field
 
 from ace_step_api.backends.base import (
+    EngineStatus,
     GenerationPlan,
     GenerationRequest,
     GenerationResult,
@@ -25,15 +29,20 @@ from ace_step_api.workflows.base import (
 )
 from tests.conftest import make_wav
 
+# each real engine's sample rate; anything else gets make_wav's default (48 kHz)
+ENGINE_RATES = {"acestep": 48000, "minimax": 44100}
+
 
 class FakeMusicBackend(MusicBackend):
     """``mode`` picks the outcome:
 
     ok (writes one file per requested track: a real WAV when ``wav`` is set, else the
     prompt as text), fail, timeout, crash (raises), no_output, short (one track fewer),
+    unstoppable (the engine could not be stopped), rejected (the engine refused the input),
     malformed (not a WAV), mono (a mono WAV), ignore_cancel (finishes normally even when
     canceled, like an engine without real cancel).
-    ``block`` keeps a run going until ``release`` (or cancel) is set.
+    ``block`` keeps a run going until ``release`` (or cancel) is set. ``statuses`` overrides
+    ``engine_status`` per engine.
     """
 
     name: ClassVar[str] = "fake"
@@ -49,6 +58,7 @@ class FakeMusicBackend(MusicBackend):
         self.calls: list[GenerationRequest] = []
         self.recovered: list[Path] = []
         self.healthy = True
+        self.statuses: dict[str, EngineStatus] = {}
         self.lifecycle: list[str] = []
         self.peer_check: Callable[[], bool] | None = None
 
@@ -57,6 +67,12 @@ class FakeMusicBackend(MusicBackend):
 
     def plan(self, request: GenerationRequest) -> GenerationPlan:
         return GenerationPlan(request.count, estimate_seconds=10.0)
+
+    def engine_status(self, engine: str) -> EngineStatus:
+        default = EngineStatus(
+            available=self.healthy, reason=None if self.healthy else "model missing"
+        )
+        return self.statuses.get(engine, default)
 
     def health(self) -> list[Check]:
         level = Level.OK if self.healthy else Level.FAIL
@@ -107,6 +123,21 @@ class FakeMusicBackend(MusicBackend):
             )
         if self.mode == "no_output":
             return GenerationResult(plan=plan, duration_s=1.0)
+        if self.mode == "unstoppable":
+            return GenerationResult(
+                plan=plan,
+                duration_s=1.0,
+                failure="engine x could not be stopped",
+                failure_code="engine_unstoppable",
+            )
+        if self.mode == "rejected":
+            return GenerationResult(
+                plan=plan,
+                duration_s=1.0,
+                failure="the engine rejected the input: ValueError: too many tokens",
+                failure_code="invalid_params",
+                retryable=False,
+            )
         run_dir.mkdir(parents=True, exist_ok=True)
         count = request.count - 1 if self.mode == "short" else request.count
         outputs = tuple(self._write(run_dir / f"raw-{i}.wav", request) for i in range(count))
@@ -118,7 +149,10 @@ class FakeMusicBackend(MusicBackend):
         if self.mode == "malformed":
             path.write_bytes(b"RIFF\x00\x00\x00\x00WAVE this is not really a wav")
         elif self.wav:
-            make_wav(path, self.seconds, channels=1 if self.mode == "mono" else 2)
+            channels = 1 if self.mode == "mono" else 2
+            make_wav(
+                path, self.seconds, rate=ENGINE_RATES.get(request.engine, 48000), channels=channels
+            )
         else:
             path.write_text(request.prompt)
         return path
@@ -155,6 +189,7 @@ class EchoWorkflow(Workflow):
     ) -> GenerationRequest:
         return GenerationRequest(
             job_id=job_id,
+            engine="fake",
             prompt=params["text"],
             lyrics="",
             instrumental=True,
@@ -177,3 +212,53 @@ class EchoWorkflow(Workflow):
 
     def smoke_params(self) -> dict[str, Any]:
         return {"text": "hi"}
+
+
+# -- engine installs ---------------------------------------------------------------------------
+
+
+def python_wrapper(path: Path) -> Path:
+    """A wrapper, not a symlink: a venv is found from the path the interpreter runs as."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    path.chmod(0o755)
+    return path
+
+
+def acestep_checkout(tmp_path: Path, models: tuple[str, ...] | None = None) -> Path:
+    root = tmp_path / "ACE-Step"
+    (root / "acestep").mkdir(parents=True)
+    python_wrapper(root / ".venv" / "bin" / "python")
+    names = models or ("acestep-v15-turbo", "vae", "Qwen3-Embedding-0.6B", "acestep-5Hz-lm-1.7B")
+    for name in names:
+        (root / "checkpoints" / name).mkdir(parents=True)
+        (root / "checkpoints" / name / "model.safetensors").write_bytes(b"x")
+    return root
+
+
+MINIMAX_REPO = "mlx-community/MiniMax-Music3-mxfp8"
+MINIMAX_SHARDS = ("model-00001-of-00002.safetensors", "model-00002-of-00002.safetensors")
+
+
+def minimax_runtime(tmp_path: Path, repo: str = MINIMAX_REPO) -> dict[str, str]:
+    """A venv with mlx-audio's MiniMax Music 3 package and a Hugging Face cache holding
+    ``repo``, laid out like the real ones. Returns the ``[backends.minimax]`` options."""
+    venv = tmp_path / "minimax-music3" / ".venv"
+    python = python_wrapper(venv / "bin" / "python")
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    package = venv / "lib" / "python3.12" / "site-packages" / "mlx_audio" / "music" / "models"
+    (package / "minimax_music3").mkdir(parents=True)
+    (package / "minimax_music3" / "__init__.py").write_text("")
+    hf_home = tmp_path / "hf"
+    cache = hf_home / "hub" / ("models--" + repo.replace("/", "--"))
+    snapshot = cache / "snapshots" / "d00a12c3"
+    (snapshot / "tokenizer").mkdir(parents=True)
+    (cache / "refs").mkdir()
+    (cache / "refs" / "main").write_text("d00a12c3")
+    (snapshot / "config.json").write_text('{"model_type": "minimax_music3"}')
+    (snapshot / "tokenizer" / "tokenizer.json").write_text("{}")
+    weight_map = {f"layer.{i}.weight": MINIMAX_SHARDS[i % 2] for i in range(4)}
+    (snapshot / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
+    for shard in MINIMAX_SHARDS:
+        (snapshot / shard).write_bytes(b"x")
+    return {"python": str(python), "hf_home": str(hf_home), "model": repo}

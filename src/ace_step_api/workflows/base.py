@@ -56,6 +56,9 @@ class Workflow(ABC):
     description: ClassVar[str]
     output_media_type: ClassVar[str]
     params_model: ClassVar[type[BaseModel]]
+    # the engine its jobs run on (``GenerationRequest.engine``); None for workflows that do
+    # not name one (test doubles): those are always offered
+    engine: ClassVar[str | None] = None
 
     @abstractmethod
     def store_inputs(self, params: BaseModel, job_dir: Path) -> dict[str, Any]:

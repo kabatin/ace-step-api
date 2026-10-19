@@ -1,5 +1,5 @@
 """``ace-step-api doctor``: check that this machine can actually serve the registered workflows
-(the ACE-Step checkout and models, disk, power, memory, the GPU servers to wait for)."""
+(each engine's install and models, disk, power, memory, the GPU servers to wait for)."""
 
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ from ace_step_api.settings import PeerServer, Settings
 from ace_step_api.workflows.base import Workflow, WorkflowFailedError, WorkflowRegistry
 
 MIN_FREE_GB = 10
+# peak memory of each loaded engine (README "Measurements"); only one is loaded at a time
+ACESTEP_PEAK_GB = 19
+MINIMAX_PEAK_GB = 24
 MIN_MEMORY_FREE_PERCENT = 20
 MIN_MACOS = (14, 0)
 SMOKE_TIMEOUT_S = 600
@@ -113,7 +116,12 @@ def check_memory() -> Check:
         return Check("memory", Level.WARN, "memory_pressure unavailable")
     free = int(match.group(1))
     level = Level.OK if free >= MIN_MEMORY_FREE_PERCENT else Level.WARN
-    return Check("memory", level, f"{free}% free (the loaded engine peaks at ~19 GB)")
+    return Check(
+        "memory",
+        level,
+        f"{free}% free (a loaded engine peaks at ~{ACESTEP_PEAK_GB} GB ACE-Step, "
+        f"~{MINIMAX_PEAK_GB} GB MiniMax Music 3; one at a time)",
+    )
 
 
 def run_smoke(settings: Settings, backend: MusicBackend, workflow: Workflow) -> Check:
@@ -165,6 +173,14 @@ def _smoke(settings: Settings, backend: MusicBackend, workflow: Workflow) -> Che
     )
 
 
+def _unavailable_engine(check: Check) -> Check:
+    return Check(
+        check.name,
+        Level.WARN,
+        f"{check.detail} (its workflow is unavailable; another engine serves)",
+    )
+
+
 def run_doctor(
     settings: Settings,
     backend: MusicBackend,
@@ -174,12 +190,19 @@ def run_doctor(
     emit: Callable[[Check], None] | None = None,
     config_path: Path | None = None,
 ) -> list[Check]:
+    engine_checks = backend.health()
+    engines = sorted({w.engine for w in registry if w.engine is not None})
+    if any(backend.engine_status(engine).available for engine in engines):
+        # one engine is enough to serve: a missing one is reported, not counted as a problem.
+        # An available engine has no failing check (both come from the same files), so every
+        # failing engine check here belongs to an unavailable one.
+        engine_checks = [_unavailable_engine(c) if c.failed else c for c in engine_checks]
     checks: list[Check] = [
         check_platform(),
         check_macos(),
         check_python(),
         check_config_file(config_path),
-        *backend.health(),
+        *engine_checks,
         check_disk(settings.data_dir),
         check_power(),
         check_memory(),
@@ -188,8 +211,12 @@ def run_doctor(
     for check in checks:
         if emit is not None:
             emit(check)
-    if smoke and not any(check.failed for check in checks):
+    # one engine missing does not stop the smoke of the other
+    machine_ok = not any(check.failed for check in checks if check not in engine_checks)
+    if smoke and machine_ok:
         for workflow in registry:
+            if workflow.engine is not None and not backend.engine_status(workflow.engine).available:
+                continue  # its engine check already failed above
             check = run_smoke(settings, backend, workflow)
             checks.append(check)
             if emit is not None:

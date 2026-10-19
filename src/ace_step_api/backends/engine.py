@@ -1,13 +1,14 @@
-"""A resident ACE-Step worker process, so consecutive jobs skip the model load.
+"""A resident engine worker process, so consecutive jobs skip the model load.
 
-The worker (:mod:`ace_step_api.backends.acestep_worker`) runs in the ACE-Step checkout's own
-Python and keeps the DiT, VAE, text encoder and 5 Hz language model loaded. It holds several GB
-of unified memory, so:
+Each engine's worker (:mod:`ace_step_api.backends.acestep_worker`,
+:mod:`ace_step_api.backends.minimax_worker`) runs in that engine's own Python and keeps its
+models loaded. A worker holds many GB of unified memory, so:
 
 - it is started lazily by the first job and kept while jobs keep coming;
 - it is stopped after ``idle_seconds`` without a job, as soon as another GPU server on the Mac
   is seen busy while it idles, after a job that did not succeed (canceled, timed out, failed:
-  a fresh process is the only way to be sure the GPU is released), and on shutdown.
+  a fresh process is the only way to be sure the GPU is released), when another engine of this
+  server takes the GPU, and on shutdown.
 
 It is a child in its own process group with a pid file in ``state_dir``, so a restarted
 ace-step-api stops a worker left behind by a crashed one (pid + script name + start time must
@@ -34,7 +35,6 @@ from ace_step_api.logs import event
 
 log = logging.getLogger("ace_step_api.engine")
 
-WORKER_SCRIPT = Path(__file__).with_name("acestep_worker.py")
 LOG_FILE = "worker.log"
 MAX_REPLY_BYTES = 64 * 1024
 
@@ -44,40 +44,26 @@ ProgressFn = Callable[[float], None]
 
 @dataclass(frozen=True)
 class EngineConfig:
+    # short engine name for logs ("acestep", "minimax")
+    name: str
     python: Path
-    project_root: Path
-    dit_model: str
-    lm_model: str
-    lm_backend: str
+    # the worker script (runs in ``python``) and its engine-specific arguments
+    script: Path
+    args: tuple[str, ...]
+    # working directory of the worker
+    cwd: Path
+    # pid file and worker log; one directory per engine
     state_dir: Path
     idle_seconds: float
     poll_seconds: float
-    # True/False: run the DiT and VAE on MLX or PyTorch (engines that offer the switch)
-    mlx_dit: bool | None = None
     start_timeout_s: float = 600.0
     stop_grace_s: float = 15.0
     env: Mapping[str, str] = field(default_factory=dict)
-    script: Path = WORKER_SCRIPT
 
 
 def worker_command(config: EngineConfig, proto_fd: int) -> list[str]:
-    # -P: the script's own directory (this package) must not shadow ``acestep``
-    return [
-        str(config.python),
-        "-P",
-        str(config.script),
-        "--proto-fd",
-        str(proto_fd),
-        "--project-root",
-        str(config.project_root),
-        "--dit-model",
-        config.dit_model,
-        "--lm-model",
-        config.lm_model,
-        "--lm-backend",
-        config.lm_backend,
-        *([] if config.mlx_dit is None else ["--mlx-dit", "on" if config.mlx_dit else "off"]),
-    ]
+    # -P: the script's own directory (this package) must not shadow the engine's modules
+    return [str(config.python), "-P", str(config.script), "--proto-fd", str(proto_fd), *config.args]
 
 
 @dataclass(frozen=True)
@@ -88,10 +74,21 @@ class TrackOutcome:
     timed_out: bool = False
     failure: str | None = None
     reply: dict[str, Any] = field(default_factory=dict)
+    # the engine refused the input (its worker is fine and kept)
+    input_error: bool = False
+    # stopping the worker after a cancel or timeout failed: it still holds the GPU
+    unstoppable: bool = False
 
 
 class EngineError(RuntimeError):
     """The worker could not be started (the message is operator-facing)."""
+
+
+class EngineUnstoppableError(EngineError):
+    """An earlier worker survived SIGKILL and still holds its memory: nothing may start."""
+
+
+UNSTOPPABLE = "the engine worker could not be stopped (it survived SIGKILL)"
 
 
 class _Worker:
@@ -140,6 +137,10 @@ class ResidentEngine:
         self._clock = clock
         self._lock = threading.RLock()
         self._worker: _Worker | None = None
+        # a worker that outlived SIGKILL (stuck in the GPU driver) until it is finally gone
+        self._stuck: subprocess.Popen[bytes] | None = None
+        # the worker has said "ready" (models in memory); read without the lock by health
+        self._ready = False
         self._in_use = False
         self._last_used = clock()
         self._peer_busy: PeerCheck | None = None
@@ -156,9 +157,16 @@ class ResidentEngine:
         with self._lock:
             return self._worker.proc.pid if self._worker is not None else None
 
+    @property
+    def stuck_pid(self) -> int | None:
+        stuck = self._stuck
+        return stuck.pid if stuck is not None else None
+
     def running(self) -> bool:
-        with self._lock:
-            return self._worker is not None and self._worker.alive()
+        """A loaded worker is up. Lock-free: the lock is held for a whole model load or stop,
+        and health checks must not wait for that."""
+        worker = self._worker
+        return self._ready and worker is not None and worker.alive()
 
     # -- use ---------------------------------------------------------------------------
     def acquire(self, job_id: str, cancel: threading.Event, deadline: float) -> bool:
@@ -167,6 +175,11 @@ class ResidentEngine:
         with self._lock:
             if self._closed.is_set():
                 raise EngineError("ace-step-api is stopping")
+            if not self._stuck_gone_locked():
+                raise EngineUnstoppableError(
+                    f"{UNSTOPPABLE}: pid {self.stuck_pid} still holds the GPU; restart the server "
+                    "if it does not exit"
+                )
             self._in_use = True
             self.last_load_s = None
             if self._worker is not None and self._worker.alive():
@@ -185,9 +198,11 @@ class ResidentEngine:
             elif self.config.idle_seconds <= 0:
                 self._stop_locked("resident mode is off", job_id=job_id)
 
-    def stop(self, reason: str) -> None:
+    def stop(self, reason: str) -> bool:
+        """Stop the worker (waiting for a stop already under way). True once no worker of this
+        engine holds memory; False while one survives SIGKILL."""
         with self._lock:
-            self._stop_locked(reason)
+            return self._stop_locked(reason) and self._stuck_gone_locked()
 
     def shutdown(self) -> None:
         self._closed.set()
@@ -215,10 +230,12 @@ class ResidentEngine:
             return TrackOutcome(False, 0.0, failure="the engine worker is not running")
         while True:
             if cancel.is_set():
-                self.stop("the job was canceled")
+                if not self.stop("the job was canceled"):
+                    return self._unstoppable(started)
                 return TrackOutcome(False, time.monotonic() - started, canceled=True)
             if time.monotonic() > deadline:
-                self.stop("the job timed out")
+                if not self.stop("the job timed out"):
+                    return self._unstoppable(started)
                 return TrackOutcome(False, time.monotonic() - started, timed_out=True)
             try:
                 message = worker.messages.get(timeout=0.5)
@@ -237,7 +254,15 @@ class ResidentEngine:
                 return TrackOutcome(True, seconds, reply=message)
             elif kind == "error" and message.get("id") == job_id:
                 reason = str(message.get("message") or "the engine reported an error")
-                return TrackOutcome(False, seconds, failure=reason[:2000])
+                return TrackOutcome(
+                    False, seconds, failure=reason[:2000], input_error=message.get("input") is True
+                )
+
+    @staticmethod
+    def _unstoppable(started: float) -> TrackOutcome:
+        return TrackOutcome(
+            False, time.monotonic() - started, failure=UNSTOPPABLE, unstoppable=True
+        )
 
     # -- process -----------------------------------------------------------------------
     def _start_locked(self, job_id: str, cancel: threading.Event, deadline: float) -> bool:
@@ -251,7 +276,7 @@ class ResidentEngine:
             with (config.state_dir / LOG_FILE).open("ab") as worker_log:
                 proc = subprocess.Popen(
                     worker_command(config, write_fd),
-                    cwd=config.project_root,
+                    cwd=config.cwd,
                     stdin=subprocess.PIPE,
                     stdout=worker_log,
                     stderr=subprocess.STDOUT,
@@ -266,7 +291,8 @@ class ResidentEngine:
             os.close(write_fd)
         (config.state_dir / PID_FILE).write_text(str(proc.pid), encoding="utf-8")
         self._worker = _Worker(proc, os.fdopen(read_fd, "rb"))
-        event(log, "engine.starting", job_id=job_id, pid=proc.pid)
+        self._ready = False
+        event(log, "engine.starting", engine=config.name, job_id=job_id, pid=proc.pid)
         while True:
             if cancel.is_set():
                 self._stop_locked("the job was canceled while loading", job_id=job_id)
@@ -283,11 +309,13 @@ class ResidentEngine:
                 self._stop_locked("load failed", job_id=job_id, level=logging.WARNING)
                 raise EngineError(f"the engine could not load its models: {detail}")
             if message.get("event") == "ready":
+                self._ready = True
                 self.last_load_s = round(time.monotonic() - started, 2)
                 self._last_used = self._clock()
                 event(
                     log,
                     "engine.ready",
+                    engine=config.name,
                     job_id=job_id,
                     pid=proc.pid,
                     load_seconds=self.last_load_s,
@@ -297,13 +325,30 @@ class ResidentEngine:
                 self._ensure_monitor()
                 return True
 
+    def _stuck_gone_locked(self) -> bool:
+        """True unless a worker that survived SIGKILL is still alive."""
+        stuck = self._stuck
+        if stuck is None:
+            return True
+        if stuck.poll() is None:
+            return False
+        self._stuck = None
+        pid_file = self.config.state_dir / PID_FILE
+        with contextlib.suppress(OSError):
+            if pid_file.read_text(encoding="utf-8").strip() == str(stuck.pid):
+                pid_file.unlink()
+        event(log, "engine.unstuck", engine=self.config.name, pid=stuck.pid)
+        return True
+
     def _stop_locked(
         self, reason: str, *, job_id: str | None = None, level: int = logging.INFO
-    ) -> None:
+    ) -> bool:
+        """Stop the worker; True when its process group is gone (or there was none)."""
         worker, self._worker = self._worker, None
+        self._ready = False
         self._in_use = False
         if worker is None:
-            return
+            return True
         proc = worker.proc
         if proc.poll() is None:
             worker.send({"cmd": "quit"})
@@ -313,16 +358,28 @@ class ResidentEngine:
         if proc.stdin is not None:
             with contextlib.suppress(OSError):
                 proc.stdin.close()
-        if proc.poll() is not None:
-            # keep the pid file of a worker we could not stop: a restart reaps it
+        gone = proc.poll() is not None
+        if gone:
             (self.config.state_dir / PID_FILE).unlink(missing_ok=True)
-        event(log, "engine.stopped", level=level, job_id=job_id, pid=proc.pid, reason=reason)
+        else:
+            # keep its pid file (a restart reaps it) and refuse every load while it lives
+            self._stuck = proc
+        event(
+            log,
+            "engine.stopped" if gone else "engine.unstoppable",
+            level=level if gone else logging.CRITICAL,
+            engine=self.config.name,
+            job_id=job_id,
+            pid=proc.pid,
+            reason=reason,
+        )
+        return gone
 
     # -- monitor -----------------------------------------------------------------------
     def _ensure_monitor(self) -> None:
         if self._monitor is None or not self._monitor.is_alive():
             self._monitor = threading.Thread(
-                target=self._watch, name="ace-step-api-engine", daemon=True
+                target=self._watch, name=f"ace-step-api-{self.config.name}", daemon=True
             )
             self._monitor.start()
 

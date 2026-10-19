@@ -9,8 +9,9 @@ AUTH=()                                   # or: AUTH=(-H "Authorization: Bearer 
 
 ```sh
 curl -s "${AUTH[@]}" "$API/healthz"
-# {"status":"ok","version":"0.1.0","running":0,"waiting":0,"max_waiting":2,"waiting_for_peer":0}
-curl -s "${AUTH[@]}" "$API/v1/capabilities" | jq '{queue, coordination, w: .workflows[0] | {duration_sec, count, typical_seconds}}'
+# {"status":"ok","version":"0.1.0","running":0,"waiting":0,"max_waiting":2,"waiting_for_peer":0,
+#  "workflows":{"ace-step-1.5":{…},"minimax-music3":{…}}}
+curl -s "${AUTH[@]}" "$API/v1/capabilities" | jq '{queue, coordination, w: .workflows[] | {id, duration_sec, count, typical_seconds}}'
 ```
 
 ## A song with Japanese lyrics, two takes
@@ -73,3 +74,32 @@ Retry-After: 30
 ```
 
 Wait `Retry-After` seconds and submit again. Nothing was queued.
+
+## MiniMax Music 3
+
+The same body on the other workflow. It is slow (~10 minutes per 60 s track) and its `duration_sec` is an
+upper bound: check `duration_sec` of each output.
+
+```sh
+curl -s "${AUTH[@]}" "$API/v1/health" | jq .workflows
+# {"ace-step-1.5":{"available":true,"loaded":false,"reason":null},
+#  "minimax-music3":{"available":true,"loaded":false,"reason":null}}
+
+jq -n --arg lyrics $'[verse]\nMorning light across the room\n[chorus]\nSing with me' '{
+  prompt: "warm acoustic pop, 96 BPM, intimate female vocal",
+  lyrics: $lyrics,
+  duration_sec: 60,
+  seed: 7
+}' > song.json
+curl -s "${AUTH[@]}" -X POST "$API/v1/workflows/minimax-music3/jobs" \
+  -H 'Content-Type: application/json' --data-binary @song.json
+# → 202 …; 503 {"error":{"code":"workflow_unavailable",…}} if MiniMax is not installed on the server
+
+curl -s "${AUTH[@]}" -X POST "$API/v1/workflows/minimax-music3/jobs" \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt": "lo-fi hip hop, mellow piano, vinyl crackle, 80 BPM", "instrumental": true, "duration_sec": 30}'
+```
+
+A commercial product using these tracks must display "MiniMax-Music3" in its UI (see the README's
+*License*).
+

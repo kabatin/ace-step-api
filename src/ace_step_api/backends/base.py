@@ -24,6 +24,8 @@ ProgressCallback = Callable[[float], None]
 @dataclass(frozen=True)
 class GenerationRequest:
     job_id: str
+    # which engine makes the tracks ("acestep", "minimax"): set by the workflow
+    engine: str
     # style tags / description of the music
     prompt: str
     # structured lyrics ([verse], [chorus], ...); empty when instrumental
@@ -35,6 +37,16 @@ class GenerationRequest:
     count: int
     # ISO 639-1 code of the sung language, or "unknown" (the engine then decides)
     vocal_language: str = "unknown"
+
+
+@dataclass(frozen=True)
+class EngineStatus:
+    # installed with its model files present: jobs for it are accepted
+    available: bool
+    # its worker is up with the models in memory (false while idle: loaded on the next job)
+    loaded: bool = False
+    # why it is not available (shown to clients: short, no paths)
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +66,8 @@ class GenerationResult:
     # operator-facing reason (may contain paths: the queue redacts it before storing)
     failure: str | None = None
     failure_code: str = "generation_failed"
+    # False when trying again cannot help (the engine refused the input)
+    retryable: bool = True
     # engine timings (load, per track), JSON-safe
     details: dict[str, Any] = field(default_factory=dict)
     log_path: Path | None = None
@@ -104,6 +118,19 @@ class MusicBackend(ABC):
     ) -> GenerationResult:
         """Run one job (all tracks). Must return (not raise) for engine failures, cancel,
         timeout."""
+
+    def typical_seconds_for(self, engine: str, duration_s: float) -> float:
+        """``typical_seconds`` of one engine (backends with several engines pick it)."""
+        return self.typical_seconds(duration_s)
+
+    def engine_status(self, engine: str) -> EngineStatus:
+        """Whether ``engine`` can take jobs now and whether its models are in memory."""
+        return EngineStatus(available=True)
+
+    def unload(self, reason: str) -> bool:
+        """Give back the memory of models kept loaded between jobs (no job is running).
+        False when a worker could not be stopped and still holds its memory."""
+        return True
 
     def recover(self, run_dir: Path) -> str | None:
         """Clean up after a run the server lost track of (restart). Returns what was done."""

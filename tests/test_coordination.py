@@ -387,6 +387,7 @@ def test_a_job_waits_queued_while_another_gpu_server_is_busy(
         "waiting": 0,
         "max_waiting": 1,
         "waiting_for_peer": 1,
+        "workflows": {},  # echo runs on no engine
     }
     assert not backend.calls
     time.sleep(0.3)

@@ -5,13 +5,14 @@ from pathlib import Path
 import pytest
 
 from ace_step_api import cli, doctor
+from ace_step_api.backends.base import EngineStatus
 from ace_step_api.checks import Check, Level
 from ace_step_api.doctor import check_disk, check_macos, check_memory, check_power, run_doctor
 from ace_step_api.jobs.store import JobStore
 from ace_step_api.logs import JsonFormatter, event
 from ace_step_api.settings import Settings, load_settings
 from ace_step_api.workflows import build_registry
-from tests.fakes import FakeMusicBackend
+from tests.fakes import FakeMusicBackend, acestep_checkout, minimax_runtime
 
 TOKEN = "test-token-0123456789-abcdefghijklmnop"
 
@@ -127,14 +128,33 @@ def test_peer_checks_never_fail(
     assert doctor.check_peer(peer).detail == "busy (running 1, waiting 2)"
 
 
-def test_smoke_runs_a_short_job(settings: Settings, healthy: None) -> None:
+def test_smoke_runs_a_short_job_per_workflow(settings: Settings, healthy: None) -> None:
     backend = FakeMusicBackend(wav=True, seconds=0.5)
     checks = by_name(run_doctor(settings, backend, build_registry(backend), smoke=True))
     smoke = checks["smoke ace-step-1.5"]
     assert smoke.level is Level.OK and "0.5 s WAV, 48000 Hz" in smoke.detail
-    call = backend.calls[0]
-    assert call.instrumental and call.duration_s == 10.0 and call.count == 1
+    assert "0.5 s WAV, 44100 Hz" in checks["smoke minimax-music3"].detail
+    assert [call.engine for call in backend.calls] == ["acestep", "minimax"]
+    for call in backend.calls:
+        assert call.instrumental and call.duration_s == 10.0 and call.count == 1
     assert not any((settings.data_dir / "smoke").iterdir())
+
+
+def test_smoke_skips_only_the_unavailable_engine(settings: Settings, healthy: None) -> None:
+    backend = FakeMusicBackend(wav=True, seconds=0.5)
+    backend.statuses = {"minimax": EngineStatus(available=False, reason="not installed")}
+    checks = by_name(run_doctor(settings, backend, build_registry(backend), smoke=True))
+    assert checks["smoke ace-step-1.5"].level is Level.OK
+    assert "smoke minimax-music3" not in checks
+    assert [call.engine for call in backend.calls] == ["acestep"]
+
+
+def test_memory_check_names_both_engines(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        doctor, "_run", fake_run({"memory_pressure": "System-wide memory free percentage: 64%"})
+    )
+    detail = check_memory().detail
+    assert "~19 GB ACE-Step" in detail and "~24 GB MiniMax Music 3" in detail
 
 
 def test_smoke_failure_is_reported(settings: Settings, healthy: None) -> None:
@@ -153,6 +173,67 @@ def test_smoke_is_skipped_when_checks_fail(settings: Settings, healthy: None) ->
     assert not backend.calls and "smoke ace-step-1.5" not in by_name(checks)
 
 
+def two_engines(tmp_path: Path, *, ace: bool, minimax: bool):
+    """The real router; an engine that is not installed points at empty directories."""
+    from ace_step_api.backends.acestep import AceStepBackend, AceStepOptions
+    from ace_step_api.backends.minimax import MiniMaxBackend, MiniMaxOptions
+    from ace_step_api.backends.router import EngineRouter
+
+    ace_options = (
+        AceStepOptions(project_root=acestep_checkout(tmp_path / "a")) if ace else AceStepOptions()
+    )
+    minimax_options = MiniMaxOptions.model_validate(
+        minimax_runtime(tmp_path / "m")
+        if minimax
+        else {"python": str(tmp_path / "none" / "python"), "hf_home": str(tmp_path / "none")}
+    )
+    return EngineRouter(
+        {
+            "acestep": AceStepBackend(ace_options, state_dir=tmp_path / "engine"),
+            "minimax": MiniMaxBackend(minimax_options, state_dir=tmp_path / "engine" / "minimax"),
+        }
+    )
+
+
+@pytest.mark.parametrize("missing", ["acestep", "minimax"])
+def test_a_missing_engine_is_a_warning_while_the_other_is_available(
+    settings: Settings, healthy: None, tmp_path: Path, missing: str
+) -> None:
+    router = two_engines(tmp_path, ace=missing != "acestep", minimax=missing != "minimax")
+    checks = run_doctor(settings, router, build_registry(router))
+    assert not any(check.failed for check in checks)
+    warned = [c for c in checks if c.level is Level.WARN and "workflow is unavailable" in c.detail]
+    prefix = "ACE-Step" if missing == "acestep" else "MiniMax"
+    assert warned and all(c.name.startswith(prefix) for c in warned)
+
+
+def test_no_engine_at_all_is_a_failure(settings: Settings, healthy: None, tmp_path: Path) -> None:
+    router = two_engines(tmp_path, ace=False, minimax=False)
+    checks = by_name(run_doctor(settings, router, build_registry(router)))
+    assert checks["ACE-Step checkout"].failed and checks["MiniMax Python"].failed
+    assert checks["MiniMax Music 3 model"].failed
+
+
+def test_doctor_exits_0_with_one_engine_and_1_with_none(
+    env: FakeMusicBackend,
+    healthy: None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        cli, "build_backend", lambda _s: two_engines(tmp_path, ace=True, minimax=False)
+    )
+    assert cli.main(["doctor"]) == 0
+    out = capsys.readouterr().out
+    assert "all good" in out and "! MiniMax Python" in out
+    none = tmp_path / "none-at-all"
+    monkeypatch.setattr(
+        cli, "build_backend", lambda _s: two_engines(none, ace=False, minimax=False)
+    )
+    assert cli.main(["doctor"]) == 1
+
+
 # -- CLI -------------------------------------------------------------------------------
 
 
@@ -165,8 +246,11 @@ def test_version(capsys: pytest.CaptureFixture[str]) -> None:
 def test_workflows_and_config_hide_the_token(
     env: FakeMusicBackend, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    env.statuses = {"minimax": EngineStatus(available=False, reason="not installed")}
     assert cli.main(["workflows"]) == 0
-    assert "ace-step-1.5" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "ace-step-1.5" in out and "engine: acestep (available)" in out
+    assert "minimax-music3" in out and "engine: minimax (unavailable: not installed)" in out
     assert cli.main(["config"]) == 0
     out = capsys.readouterr().out
     assert "token = ********" in out and TOKEN not in out and "port = 8768" in out
@@ -219,7 +303,24 @@ def test_serve_fails_early_when_the_backend_cannot_generate(
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: pytest.fail("must not start"))
     assert cli.main(["serve"]) == 1
     err = capsys.readouterr().err
-    assert "cannot generate" in err and "model missing" in err
+    assert "no engine can generate" in err
+    assert "acestep: model missing" in err and "minimax: model missing" in err
+
+
+@pytest.mark.parametrize("down", ["acestep", "minimax"])
+def test_serve_starts_with_one_engine_available(
+    env: FakeMusicBackend,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    down: str,
+) -> None:
+    env.statuses = {down: EngineStatus(available=False, reason="not installed")}
+    seen: dict = {}
+    monkeypatch.setattr("uvicorn.run", lambda app, **kw: seen.update(kw, app=app))
+    assert cli.main(["serve"]) == 0 and "app" in seen
+    captured = capsys.readouterr()
+    assert f"warning: engine {down} is unavailable: not installed" in captured.err
+    assert "workflows: ace-step-1.5, minimax-music3" in captured.out
 
 
 def test_serve_refuses_second_instance(
@@ -255,14 +356,17 @@ def test_json_log_lines() -> None:
     assert line["total_seconds"] == 3.5 and line["level"] == "info"
 
 
-def test_build_backend_is_ace_step(tmp_path: Path) -> None:
+def test_build_backend_routes_both_engines(tmp_path: Path) -> None:
     from ace_step_api.backends import build_backend
     from ace_step_api.backends.acestep import AceStepBackend
+    from ace_step_api.backends.minimax import MiniMaxBackend
 
     base = {"ACE_STEP_API_DATA_DIR": str(tmp_path)}
     default = build_backend(load_settings(env=base, config_path=tmp_path / "x"))
-    assert isinstance(default, AceStepBackend) and default.project_root is None
-    assert default.health()[0].failed
+    ace, minimax = default.engines["acestep"], default.engines["minimax"]
+    assert isinstance(ace, AceStepBackend) and ace.project_root is None
+    assert isinstance(minimax, MiniMaxBackend)  # its availability depends on this machine
+    assert ace.health()[0].failed and not default.engine_status("acestep").available
 
 
 def test_smoke_refuses_while_a_server_holds_the_data_dir(settings: Settings, healthy: None) -> None:
