@@ -263,7 +263,9 @@ running job is never paused. Redirects are not followed, so a peer token only ev
 **Yielding.** While its head job waits for a peer, ace-step-api's own `/v1/health` reports the queue as
 `waiting_for_peer` and `waiting: 0`. klein-api can therefore list ace-step-api in its `coordinate_with`
 without the two waiting for each other forever: klein-api goes first, ace-step-api follows. vpipe-api
-counts only its own `vpipe --launch` processes, so it never waits for ace-step-api.
+0.1.4 and later can list ace-step-api too and yields the same way: when both have jobs waiting, the first
+final check to pass starts its job and the other sees `running: 1` and waits. Both start only if the two
+final checks overlap, a window as long as one check.
 
 ### Resident engine
 

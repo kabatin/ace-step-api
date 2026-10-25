@@ -245,8 +245,10 @@ head job is waiting for a peer, `/v1/health` reports those queued jobs as `waiti
 `waiting: 0`, so klein-api sees it idle and goes first. A running ace-step-api job reports
 `running: 1`, which makes klein-api wait.
 
-vpipe-api does not read other servers' health: it only counts its own `vpipe --launch` processes. It
-therefore never waits for ace-step-api; ace-step-api waits for it.
+vpipe-api 0.1.4 and later can list ace-step-api in its own `coordinate_with` too, and it yields the
+same way. When both have jobs waiting, the first final check to pass starts its job; the other then
+sees `running: 1` and waits. Both start only if the two final checks overlap, a window as long as one
+check.
 
 **Memory.** Between jobs the models stay loaded for `resident_idle_seconds` (default 120) so that
 follow-up tracks skip the load (~25 s for ACE-Step). An engine is released at once when a job of the
