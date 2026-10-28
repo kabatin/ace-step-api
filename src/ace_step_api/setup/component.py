@@ -23,6 +23,7 @@ class Plan:
 
     working: bool  # the engine can generate from here
     reason: str | None  # why not, for the report
+    unsupported: bool = False  # setup cannot install it (reason says why)
     download_bytes: int = 0
     disk_bytes: int = 0
     # [backends.<name>] keys the config needs for the server to find this install

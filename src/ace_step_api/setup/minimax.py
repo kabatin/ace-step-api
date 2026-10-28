@@ -46,7 +46,9 @@ class MiniMaxComponent:
         if _backend(current).unavailable_reason() is None:
             return Plan(working=True, reason=None)
         if target.model != DEFAULT_MODEL:
-            return Plan(working=False, reason=f"setup installs {DEFAULT_MODEL} only")
+            return Plan(
+                working=False, reason=f"setup installs {DEFAULT_MODEL} only", unsupported=True
+            )
         wanted: dict[str, Any] = {
             "python": str(target.python.expanduser()),
             "hf_home": str(target.hf_home.expanduser()),

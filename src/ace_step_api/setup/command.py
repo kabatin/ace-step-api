@@ -35,6 +35,7 @@ EXIT_OK, EXIT_FAILED, EXIT_USAGE, EXIT_CONFIRM = 0, 1, 2, 3
 @dataclass(frozen=True)
 class Options:
     models: tuple[str, ...]
+    explicit: bool = False  # --models named them: one setup cannot install is a failure
     check: bool = False
     yes: bool = False
     lan: bool = False
@@ -140,28 +141,27 @@ def run_setup(
     if opts.check:
         healthy = tools.http_status(f"{url}/v1/health", _token(settings)) == 200
         outcomes = tuple(_checked(c, plans[c.id], machine) for c in selected)
-        return EXIT_OK, replace(base, components=outcomes, service=svc.as_json(healthy=healthy))
+        ok = _ok(outcomes, opts.explicit, check=True)
+        report = replace(base, ok=ok, components=outcomes, service=svc.as_json(healthy=healthy))
+        return (EXIT_OK if ok else EXIT_FAILED), report
 
-    todo = [c for c in selected if _pending(plans[c.id])]
-    unsupported = machine.supported_reason
-    if todo and unsupported is not None:
-        outcomes = tuple(
-            Outcome(c.id, "unsupported", unsupported) if c in todo else _done(c, plans[c.id])
-            for c in selected
-        )
-        return EXIT_FAILED, replace(base, ok=False, components=outcomes)
+    cannot = {c.id: why for c in selected if (why := _unsupported(plans[c.id], machine))}
+    todo = [c for c in selected if _pending(plans[c.id]) and c.id not in cannot]
     gate = _gate(todo, plans, machine, opts, confirm)
     if gate is not None:
         code, message, fix = gate
         outcomes = tuple(
             Outcome(c.id, "missing", message, _bytes(plans[c.id]), fix)
             if c in todo
-            else _done(c, plans[c.id])
+            else _done(c, plans[c.id], cannot)
             for c in selected
         )
         return code, replace(base, ok=False, components=outcomes, error=message)
 
-    outcomes = tuple(_install(c, plans[c.id], ctx) for c in selected)
+    outcomes = tuple(
+        _install(c, plans[c.id], ctx) if c in todo else _done(c, plans[c.id], cannot)
+        for c in selected
+    )
     try:
         changed = _write_config(config_path, existing, selected, outcomes, plans, opts, environ)
         if changed:
@@ -175,8 +175,7 @@ def run_setup(
         lan=_is_lan(settings),
         token_set=settings.token is not None,
     )
-    ok = all(o.status in ("installed", "already") for o in outcomes)
-    report = replace(base, ok=ok, components=outcomes)
+    report = replace(base, ok=_ok(outcomes, opts.explicit), components=outcomes)
     if opts.service:
         report = _service(report, svc, settings, config_path, tools)
     if not report.ok:
@@ -207,6 +206,20 @@ def _plan(component: Component, ctx: Context) -> Plan | SetupError:
         return exc
 
 
+def _ok(outcomes: Sequence[Outcome], explicit: bool, *, check: bool = False) -> bool:
+    """Unsupported is fine for the default selection, a failure when asked for by name;
+    a check is fine with missing components (reporting them is its job)."""
+    allowed = {"installed", "already"} | (set() if explicit else {"unsupported"})
+    allowed |= {"missing"} if check else set()
+    return all(o.status in allowed for o in outcomes)
+
+
+def _unsupported(plan: Plan | SetupError, machine: Machine) -> str | None:
+    if not isinstance(plan, Plan) or plan.working:
+        return None
+    return plan.reason if plan.unsupported else machine.supported_reason
+
+
 def _pending(plan: Plan | SetupError) -> bool:
     return isinstance(plan, Plan) and not plan.working
 
@@ -227,8 +240,8 @@ def _checked(component: Component, plan: Plan | SetupError, machine: Machine) ->
     if plan.working:
         note = "; setup will add it to the config" if plan.config else ""
         return Outcome(component.id, "installed", f"ready{note}")
-    if machine.supported_reason is not None:
-        return Outcome(component.id, "unsupported", machine.supported_reason)
+    if (why := _unsupported(plan, machine)) is not None:
+        return Outcome(component.id, "unsupported", why)
     return Outcome(
         component.id,
         "missing",
@@ -237,9 +250,13 @@ def _checked(component: Component, plan: Plan | SetupError, machine: Machine) ->
     )
 
 
-def _done(component: Component, plan: Plan | SetupError) -> Outcome:
+def _done(
+    component: Component, plan: Plan | SetupError, cannot: Mapping[str, str] | None = None
+) -> Outcome:
     if isinstance(plan, SetupError):
         return Outcome(component.id, "failed", str(plan), fix=_fix(plan))
+    if cannot and component.id in cannot:
+        return Outcome(component.id, "unsupported", cannot[component.id])
     return Outcome(component.id, "already", "ready")
 
 
@@ -379,6 +396,7 @@ def options_from(args: Any, env: Mapping[str, str]) -> Options:
         config_write.check_peer(*config_write.parse_peer(spec), env)
     return Options(
         models=parse_models(args.models),
+        explicit=bool(args.models and args.models.strip()),
         check=args.check,
         yes=args.yes,
         lan=args.lan,

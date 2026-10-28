@@ -42,6 +42,7 @@ def fake(tmp_path: Path) -> Fake:
 def options(tmp_path: Path, *models: str, **kw: object) -> Options:
     return Options(
         models=models or ALL,
+        explicit=bool(models),
         prefix=tmp_path / "opt",
         config=tmp_path / "config" / "config.toml",
         **kw,  # type: ignore[arg-type]
@@ -312,13 +313,49 @@ def test_too_little_disk_fails_before_downloading(fake: Fake, tmp_path: Path) ->
     assert "free disk" in (report.error or "")
 
 
-def test_install_on_an_intel_mac_is_unsupported(fake: Fake, tmp_path: Path) -> None:
+def test_install_on_an_intel_mac_reports_unsupported_and_exits_0_by_default(
+    fake: Fake, tmp_path: Path
+) -> None:
     code, report = setup(
         fake, tmp_path, options(tmp_path, yes=True), probe_machine=mac(arm64=False)
     )
-    assert code == 1
+    assert (code, report.ok) == (0, True)
     assert set(status(report).values()) == {"unsupported"}
     assert fake.calls == []
+
+
+@pytest.mark.parametrize("check", [False, True])
+def test_an_unsupported_component_asked_for_by_name_exits_1(
+    fake: Fake, tmp_path: Path, check: bool
+) -> None:
+    opts = options(tmp_path, "ace-step", yes=True, check=check)
+    code, report = setup(fake, tmp_path, opts, probe_machine=mac(arm64=False))
+    assert (code, report.ok) == (1, False)
+    assert status(report) == {"ace-step": "unsupported"}
+
+
+def test_a_model_setup_cannot_install_is_unsupported_and_the_other_goes_on(
+    fake: Fake, tmp_path: Path
+) -> None:
+    cfg = tmp_path / "config" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('[backends.minimax]\nmodel = "someone/other-model"\n')
+    ace_effects(fake)
+    code, report = setup(fake, tmp_path, options(tmp_path, yes=True))
+    assert status(report) == {"ace-step": "installed", "minimax-music3": "unsupported"}
+    assert (code, report.ok) == (0, True)
+    assert fake.commands("uv venv") == []
+
+
+def test_exit_3_reports_not_ok(fake: Fake, tmp_path: Path) -> None:
+    code, report = setup(fake, tmp_path, options(tmp_path))
+    assert (code, report.ok, report.as_json()["ok"]) == (3, False, False)
+
+
+def test_check_says_installed_for_a_working_engine(fake: Fake, tmp_path: Path) -> None:
+    installed_minimax(tmp_path)
+    _, report = setup(fake, tmp_path, options(tmp_path, check=True))
+    assert status(report)["minimax-music3"] == "installed"
 
 
 def test_missing_uv_is_a_fix_not_a_crash(fake: Fake, tmp_path: Path) -> None:
