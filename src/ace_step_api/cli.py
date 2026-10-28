@@ -1,9 +1,10 @@
-"""``ace-step-api`` command line: serve, doctor, workflows, config."""
+"""``ace-step-api`` command line: serve, doctor, workflows, config, setup."""
 
 from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
 import resource
 import sys
@@ -17,6 +18,8 @@ from ace_step_api.doctor import run_doctor
 from ace_step_api.jobs.coordination import Coordinator
 from ace_step_api.logs import configure_logging
 from ace_step_api.settings import Settings, SettingsError, load_settings, resolve_config_path
+from ace_step_api.setup import command as setup
+from ace_step_api.setup.tools import SetupError, Tools
 from ace_step_api.workflows import build_registry
 
 _MARKS = {Level.OK: "✓", Level.WARN: "!", Level.FAIL: "✗"}
@@ -171,6 +174,44 @@ def cmd_config(settings: Settings, _: argparse.Namespace) -> int:
     return 0
 
 
+def _ask(prompt: str) -> bool:
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    try:
+        return input().strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    """Runs before (and without) loading the settings: a broken config is reported, not fatal."""
+    try:
+        options = setup.options_from(args)
+    except SetupError as exc:
+        _err(f"error: {exc}")
+        if args.json:
+            _out(
+                json.dumps(
+                    {
+                        "server": "ace-step-api",
+                        "version": __version__,
+                        "ok": False,
+                        "action": "check" if args.check else "install",
+                        "error": str(exc),
+                    }
+                )
+            )
+        return setup.EXIT_USAGE
+    confirm = _ask if sys.stdin.isatty() else None
+    code, report = setup.run_setup(options, Tools(), confirm=confirm)
+    if args.json:
+        _out(json.dumps(report.as_json()))
+    else:
+        for line in setup.describe(report):
+            _out(line)
+    return code
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ace-step-api", description=__doc__)
     parser.add_argument("--version", action="version", version=f"ace-step-api {__version__}")
@@ -188,12 +229,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("workflows", help="list workflows").set_defaults(func=cmd_workflows)
     sub.add_parser("config", help="show the effective configuration").set_defaults(func=cmd_config)
+    setup.add_parser(sub)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     configure_logging()
+    if args.command == "setup":
+        try:
+            return cmd_setup(args)
+        except KeyboardInterrupt:
+            return 130
     try:
         settings = load_settings(config_path=Path(args.config) if args.config else None)
         return int(args.func(settings, args))
