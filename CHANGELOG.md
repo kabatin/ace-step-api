@@ -13,13 +13,18 @@
 - `--check` changes nothing and reports the Mac (arm64, macOS, RAM, free disk, git/uv), each component's
   state and download size, and the launchd agent. `--json` prints one object on stdout; progress goes to
   stderr. Exit 0 ok, 1 failed, 2 bad arguments, 3 needs confirmation (no terminal and no `--yes`).
+- Argument errors (also argparse's own, a bad `--label-suffix`, a `--label-suffix` without `--port`, a
+  `--lan` token or a peer URL/token from the environment that the server would reject) exit 2 before
+  anything runs; with `--json` as one complete report. An `unsupported` component fails the run only when
+  named in `--models`. Setup runs on a config the server rejects, so it can repair it.
 - Idempotent; a stalled download is interrupted and resumed; free disk is checked before downloading.
 - The config is merged, never pruned: only missing keys are added (`--lan` / `--port` set what they ask
   for), written atomically with mode 0600. `--lan` takes the token from `ACE_STEP_API_TOKEN`, the config,
   or generates one, and never prints it. `--coordinate-with` adds `[[coordinate_with]]` entries (peer
   token from `ACE_STEP_API_COORD_TOKEN_<NAME>`).
 - `--service` writes `~/Library/LaunchAgents/com.github.kabatin.ace-step-api[.<suffix>].plist`, reloads it
-  with launchctl and waits up to 60 s for `/v1/health`.
+  with launchctl (waiting for the old job to go, retrying a busy bootstrap) and waits up to 60 s for
+  `/v1/health`. Directories setup creates are 0700; a symlinked config is written through.
 
 Second engine: MiniMax Music 3, ported from the multi-engine design of sfx-api.
 

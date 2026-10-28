@@ -131,7 +131,7 @@ ace-step-api setup --lan --service    # also: listen on the LAN (with a token), 
 | `--port N` | `port` in the config |
 | `--coordinate-with NAME=HEALTH_URL` | a `[[coordinate_with]]` entry (repeatable); its token from `ACE_STEP_API_COORD_TOKEN_<NAME>` |
 | `--service` | a launchd agent `com.github.kabatin.ace-step-api` running `serve`, then waits for `/v1/health` |
-| `--label-suffix S` | a second agent (`….S`, its own log) beside the real one, for trying things out |
+| `--label-suffix S` | a second agent (`….S`, its own log) beside the real one, for trying things out (needs `--port`) |
 
 What it installs (pinned in [`src/ace_step_api/setup/pins.py`](src/ace_step_api/setup/pins.py)):
 
@@ -148,7 +148,12 @@ Setup is idempotent (an engine that already works is left alone) and resumes an 
 (a download that stops growing for 10 minutes is restarted). It checks free disk first. It adds the
 keys the server needs to `~/.config/ace-step-api/config.toml` (or `$ACE_STEP_API_CONFIG`) and never
 changes or removes one that is there: a `project_root` or `python` already in the config is where it
-installs. Exit codes: 0 ok, 1 failed, 2 bad arguments, 3 needs a confirmation.
+installs, and a symlinked config is written through to its target. It also runs when the config is
+one the server rejects (e.g. a LAN `host` without a token), so `setup --lan` can repair it.
+
+Exit codes: 0 ok, 1 failed, 2 bad arguments (with `--json`, still one JSON object), 3 needs a
+confirmation. A component this Mac cannot run (an Intel Mac, a `[backends.minimax] model` setup cannot
+fetch) is reported as `unsupported`; that fails the run only when it was named in `--models`.
 
 Or by hand:
 
