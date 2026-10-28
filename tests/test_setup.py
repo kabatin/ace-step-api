@@ -407,9 +407,32 @@ def test_service_writes_the_plist_reloads_it_and_waits_for_health(
     assert data["StandardErrorPath"].endswith("Logs/ace-step-api.verify.log")
     assert fake.commands("launchctl") == [
         ("launchctl", "bootout", f"gui/501/{label}"),
+        ("launchctl", "print", f"gui/501/{label}"),
         ("launchctl", "bootstrap", "gui/501", str(plist)),
     ]
     assert report.service == {"installed": True, "label": label, "healthy": True}
+
+
+def test_service_waits_for_bootout_and_retries_a_busy_bootstrap(fake: Fake, tmp_path: Path) -> None:
+    installed_minimax(tmp_path)
+    still_loaded = iter(["state = running", "state = running"])
+    fake.captures["launchctl print"] = lambda: next(still_loaded, None)
+    codes = iter([5, 37, 0])
+    fake.effects["launchctl bootstrap"] = lambda _cmd, _cwd: next(codes)
+    fake.health = [200]
+    code, report = setup(fake, tmp_path, options(tmp_path, "minimax-music3", service=True))
+    assert code == 0, report
+    kinds = [c[1] for c in fake.commands("launchctl")]
+    assert kinds == ["bootout", "print", "print", "print", "bootstrap", "bootstrap", "bootstrap"]
+
+
+def test_service_bootstrap_gives_up_on_other_errors(fake: Fake, tmp_path: Path) -> None:
+    installed_minimax(tmp_path)
+    fake.effects["launchctl bootstrap"] = lambda _cmd, _cwd: 1
+    code, report = setup(fake, tmp_path, options(tmp_path, "minimax-music3", service=True))
+    assert code == 1
+    assert len(fake.commands("launchctl bootstrap")) == 1
+    assert "bootstrap" in (report.error or "")
 
 
 def test_service_that_never_answers_fails(fake: Fake, tmp_path: Path) -> None:

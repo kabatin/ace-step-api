@@ -88,7 +88,7 @@ class Fake:
 
     home: Path
     effects: dict[str, Effect] = field(default_factory=dict)
-    captures: dict[str, str | None] = field(default_factory=dict)
+    captures: dict[str, str | Callable[[], str | None] | None] = field(default_factory=dict)
     downloads: list[Callable[[Sequence[str], Path | None], FakeProc]] = field(default_factory=list)
     on_path: set[str] = field(default_factory=lambda: {"git", "uv", "ace-step-api"})
     health: list[int | None] = field(default_factory=list)
@@ -107,9 +107,11 @@ class Fake:
 
     def capture(self, cmd: Sequence[str]) -> str | None:
         joined = " ".join(cmd)
+        if cmd[0] == "launchctl":
+            self.calls.append(tuple(cmd))
         for key, out in self.captures.items():
             if key in joined:
-                return out
+                return out() if callable(out) else out
         return None
 
     def spawn(self, cmd: Sequence[str], env: Mapping[str, str] | None, cwd: Path | None):

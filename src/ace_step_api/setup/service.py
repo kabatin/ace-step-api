@@ -16,6 +16,10 @@ REPO = "ace-step-api"
 LABEL = f"com.github.kabatin.{REPO}"
 HEALTH_WAIT_S = 60.0
 HEALTH_POLL_S = 2.0
+UNLOAD_WAIT_S = 10.0
+LAUNCHCTL_POLL_S = 0.5
+BOOTSTRAP_TRIES = 5
+BUSY_CODES = (5, 37)  # EIO, EALREADY: the previous instance is still being torn down
 PATH = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
 _SUFFIX = re.compile(r"^[A-Za-z0-9-]{1,32}$")
 
@@ -79,13 +83,25 @@ def install(service: Service, tools: Tools, config: Path | None) -> None:
     Path(tmp).chmod(0o644)
     Path(tmp).replace(service.plist)
     domain = f"gui/{tools.uid}"
-    tools.run(["launchctl", "bootout", f"{domain}/{service.label}"], None, None)  # not loaded: ok
-    if tools.run(["launchctl", "bootstrap", domain, str(service.plist)], None, None) != 0:
-        raise SetupError(
-            f"launchctl bootstrap {service.label} failed",
-            hint=f"see {service.log}",
-            command=f"launchctl bootstrap {domain} {service.plist}",
-        )
+    target = f"{domain}/{service.label}"
+    tools.run(["launchctl", "bootout", target], None, None)  # not loaded: ok
+    # bootout returns before the old job is gone; bootstrapping over it fails with EIO
+    deadline = tools.clock() + UNLOAD_WAIT_S
+    while tools.capture(["launchctl", "print", target]) is not None:
+        if tools.clock() >= deadline:
+            break
+        tools.sleep(LAUNCHCTL_POLL_S)
+    for attempt in range(1, BOOTSTRAP_TRIES + 1):
+        code = tools.run(["launchctl", "bootstrap", domain, str(service.plist)], None, None)
+        if code == 0:
+            break
+        if code not in BUSY_CODES or attempt == BOOTSTRAP_TRIES:
+            raise SetupError(
+                f"launchctl bootstrap {service.label} failed (exit {code})",
+                hint=f"see {service.log}",
+                command=f"launchctl bootstrap {domain} {service.plist}",
+            )
+        tools.sleep(LAUNCHCTL_POLL_S)
     tools.emit(f"service: {service.label} loaded ({service.plist})")
 
 
