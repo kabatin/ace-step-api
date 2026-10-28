@@ -448,6 +448,9 @@ def test_service_writes_the_plist_reloads_it_and_waits_for_health(
         ("launchctl", "bootstrap", "gui/501", str(plist)),
     ]
     assert report.service == {"installed": True, "label": label, "healthy": True}
+    for created in (plist.parent, plist.parent.parent, fake.home / "Library" / "Logs"):
+        assert stat.S_IMODE(created.stat().st_mode) == 0o700, created
+    assert sorted(p.name for p in plist.parent.iterdir()) == [plist.name]
 
 
 def test_service_waits_for_bootout_and_retries_a_busy_bootstrap(fake: Fake, tmp_path: Path) -> None:

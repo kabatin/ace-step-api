@@ -32,6 +32,15 @@ class SetupError(RuntimeError):
         self.human = human
 
 
+def make_private_dirs(path: Path) -> None:
+    """``mkdir -p`` where every directory it creates is 0700 (``parents=True`` would use the
+    default mode for all but the last)."""
+    missing = [p for p in (path, *path.parents) if not p.exists()]
+    for directory in reversed(missing):
+        directory.mkdir(mode=0o700, exist_ok=True)
+        directory.chmod(0o700)  # mkdir's mode is filtered by the umask
+
+
 class Proc(Protocol):
     def poll(self) -> int | None: ...
     def send_signal(self, sig: int) -> None: ...

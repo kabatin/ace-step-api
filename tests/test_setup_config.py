@@ -88,3 +88,16 @@ def test_write_refuses_a_config_the_server_would_reject(tmp_path: Path) -> None:
         write(path, {"port": 9000, "host": "0.0.0.0"})  # LAN without a token
     assert path.read_text() == "port = 9000\n"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["config.toml"]
+
+
+def test_write_through_a_symlinked_config_keeps_the_link(tmp_path: Path) -> None:
+    real = tmp_path / "dotfiles" / "ace.toml"
+    real.parent.mkdir()
+    real.write_text("port = 9000\n")
+    link = tmp_path / "config" / "config.toml"
+    link.parent.mkdir()
+    link.symlink_to(real)
+    assert write(link, {"port": 9001}) is True
+    assert link.is_symlink()
+    assert tomllib.loads(real.read_text()) == {"port": 9001}
+    assert stat.S_IMODE(real.stat().st_mode) == 0o600

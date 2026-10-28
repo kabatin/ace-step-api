@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from ace_step_api.setup.tools import SetupError, Tools
+from ace_step_api.setup.tools import SetupError, Tools, make_private_dirs
 
 REPO = "ace-step-api"
 LABEL = f"com.github.kabatin.{REPO}"
@@ -75,13 +75,17 @@ def install(service: Service, tools: Tools, config: Path | None) -> None:
             command=f"uv tool install git+https://github.com/kabatin/{REPO}",
         )
     cli = str(Path(found).absolute())  # not resolved: `uv tool upgrade` keeps this path working
-    service.plist.parent.mkdir(parents=True, exist_ok=True)
-    service.log.parent.mkdir(parents=True, exist_ok=True)
+    make_private_dirs(service.plist.parent)  # only what it creates; existing dirs are kept
+    make_private_dirs(service.log.parent)
     fd, tmp = tempfile.mkstemp(prefix=".plist-", dir=service.plist.parent)
-    with os.fdopen(fd, "wb") as handle:
-        handle.write(plist_bytes(service, cli, config))
-    Path(tmp).chmod(0o644)
-    Path(tmp).replace(service.plist)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(plist_bytes(service, cli, config))
+        Path(tmp).chmod(0o644)
+        Path(tmp).replace(service.plist)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     domain = f"gui/{tools.uid}"
     target = f"{domain}/{service.label}"
     tools.run(["launchctl", "bootout", target], None, None)  # not loaded: ok

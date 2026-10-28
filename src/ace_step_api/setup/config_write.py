@@ -23,7 +23,7 @@ from typing import Any
 from pydantic import ValidationError
 
 from ace_step_api.settings import ENV_PREFIX, PeerServer, Settings, SettingsError, load_settings
-from ace_step_api.setup.tools import SetupError
+from ace_step_api.setup.tools import SetupError, make_private_dirs
 
 _BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
 _PEER = re.compile(r"^([A-Za-z0-9._-]{1,64})=(\S+)$")
@@ -196,13 +196,15 @@ def _peers(
 
 # -- write ---------------------------------------------------------------------------------------
 def write(path: Path, data: Mapping[str, Any]) -> bool:
-    """Write ``data`` if it differs from the file; True when the file changed."""
+    """Write ``data`` if it differs from the file; True when the file changed. A symlinked
+    config is written through: the link stays, its target is replaced."""
+    path = path.resolve() if path.is_symlink() else path
     if path.is_file() and read(path) == data:
         return False
     text = dumps(data)
     if tomllib.loads(text) != data:  # the emitter must round-trip whatever it was given
         raise SetupError("internal error: the config would not read back the same")
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    make_private_dirs(path.parent)
     with contextlib.suppress(OSError):
         path.parent.chmod(0o700)
     fd, tmp = tempfile.mkstemp(prefix=".config-", suffix=".toml", dir=path.parent)
