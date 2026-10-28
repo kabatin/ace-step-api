@@ -110,6 +110,48 @@ linearly, the default `job_timeout_factor` still leaves room (see *Configuration
 
 ## Setup on the Mac
 
+The quick way: install the server, then let it install the engines.
+
+```sh
+uv tool install git+https://github.com/kabatin/ace-step-api
+ace-step-api setup --check            # what is installed, what is missing, how much it downloads
+ace-step-api setup                    # both engines (asks once before downloading ~25 GB)
+ace-step-api setup --models minimax-music3 --yes   # one engine, no question
+ace-step-api setup --lan --service    # also: listen on the LAN (with a token), run at login
+```
+
+| option | what it does |
+|---|---|
+| `--models ace-step,minimax-music3` | the components to install (default: both; either works alone) |
+| `--check` | change nothing; report the Mac, each component (`installed` / `missing` / `unsupported`) and its download size |
+| `--yes` | do not ask before downloading (without a terminal, setup asks for this and exits 3) |
+| `--json` | one JSON object on stdout (progress stays on stderr) |
+| `--prefix DIR` | where the checkout and the venv go (default `~/.local/opt/ace-step-api`) |
+| `--lan` | `host = "0.0.0.0"` and a token: `ACE_STEP_API_TOKEN` if set, else the config's, else a new one (never printed) |
+| `--port N` | `port` in the config |
+| `--coordinate-with NAME=HEALTH_URL` | a `[[coordinate_with]]` entry (repeatable); its token from `ACE_STEP_API_COORD_TOKEN_<NAME>` |
+| `--service` | a launchd agent `com.github.kabatin.ace-step-api` running `serve`, then waits for `/v1/health` |
+| `--label-suffix S` | a second agent (`….S`, its own log) beside the real one, for trying things out |
+
+What it installs (pinned in [`src/ace_step_api/setup/pins.py`](src/ace_step_api/setup/pins.py)):
+
+- `ace-step`: the Apple Silicon port at `a97f051` (the checkout measured above) cloned into
+  `<prefix>/ace-step-apple-silicon`, `uv sync` resolved as of 2026-10-17 (the port has no uv.lock; the
+  first sync writes one), then the checkout's own `download_main_model` (`ACE-Step/Ace-Step1.5`, ~10 GB,
+  MIT) into its `checkpoints/`.
+- `minimax-music3`: a Python 3.12 venv in `<prefix>/minimax-music3/.venv` with `mlx-audio==0.5.9`, then
+  `hf download mlx-community/MiniMax-Music3-mxfp8` at a fixed revision (~13 GB) into
+  `~/.local/share/minimax-music3/hf`. **Licence:** commercial use is allowed if the product shows
+  "MiniMax-Music3" prominently; over USD 20 million annual revenue needs MiniMax's permission.
+
+Setup is idempotent (an engine that already works is left alone) and resumes an interrupted download
+(a download that stops growing for 10 minutes is restarted). It checks free disk first. It adds the
+keys the server needs to `~/.config/ace-step-api/config.toml` (or `$ACE_STEP_API_CONFIG`) and never
+changes or removes one that is there: a `project_root` or `python` already in the config is where it
+installs. Exit codes: 0 ok, 1 failed, 2 bad arguments, 3 needs a confirmation.
+
+Or by hand:
+
 ```sh
 # 1. ACE-Step (anywhere; this is the layout the examples use). Either checkout works, see
 #    "Measurements": the official one is maintained and pinned, the port was 2x faster here.
@@ -182,6 +224,7 @@ generate, and starts with a warning when only one can (the other workflow answer
 
 ### Run at login (launchd)
 
+`ace-step-api setup --service` writes and loads the agent. Or by hand,
 [`examples/com.github.kabatin.ace-step-api.plist`](examples/com.github.kabatin.ace-step-api.plist):
 
 ```sh

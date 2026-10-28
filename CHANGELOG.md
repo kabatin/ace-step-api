@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+`ace-step-api setup`: install the engines with one command, the same command as the other GPU servers.
+
+- `setup [--models ace-step,minimax-music3] [--check] [--yes] [--json] [--lan] [--service] [--port N]
+  [--prefix DIR] [--label-suffix S] [--coordinate-with NAME=HEALTH_URL ...]`. `ace-step` clones the
+  Apple Silicon port at a pinned commit, `uv sync`s it and runs its `download_main_model`;
+  `minimax-music3` makes a Python 3.12 venv with `mlx-audio==0.5.9` and downloads
+  `mlx-community/MiniMax-Music3-mxfp8` at a pinned revision. Either works alone. Pins live in
+  `setup/pins.py`.
+- `--check` changes nothing and reports the Mac (arm64, macOS, RAM, free disk, git/uv), each component's
+  state and download size, and the launchd agent. `--json` prints one object on stdout; progress goes to
+  stderr. Exit 0 ok, 1 failed, 2 bad arguments, 3 needs confirmation (no terminal and no `--yes`).
+- Idempotent; a stalled download is interrupted and resumed; free disk is checked before downloading.
+- The config is merged, never pruned: only missing keys are added (`--lan` / `--port` set what they ask
+  for), written atomically with mode 0600. `--lan` takes the token from `ACE_STEP_API_TOKEN`, the config,
+  or generates one, and never prints it. `--coordinate-with` adds `[[coordinate_with]]` entries (peer
+  token from `ACE_STEP_API_COORD_TOKEN_<NAME>`).
+- `--service` writes `~/Library/LaunchAgents/com.github.kabatin.ace-step-api[.<suffix>].plist`, reloads it
+  with launchctl and waits up to 60 s for `/v1/health`.
+
 Second engine: MiniMax Music 3, ported from the multi-engine design of sfx-api.
 
 - Workflow `minimax-music3`: the `ace-step-1.5` body and rules (prompt ≤ 1000 chars, lyrics ≤ 4000,
