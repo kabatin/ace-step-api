@@ -192,7 +192,13 @@ def test_ace_step_installs_pinned_and_writes_config(fake: Fake, tmp_path: Path) 
         ("uv", "sync", "--exclude-newer", pins.ACE_STEP_EXCLUDE_NEWER)
     ]
     download = fake.commands(str(root / ".venv" / "bin" / "python"))[0]
-    assert "download_main_model(prefer_source='huggingface'" in download[-1]
+    # the weights at the tested revision, straight into checkpoints/ (not main)
+    assert "snapshot_download" in download[2]
+    assert download[3:] == (
+        pins.ACE_STEP_MODEL_REPO,
+        pins.ACE_STEP_MODEL_REVISION,
+        str(root / "checkpoints"),
+    )
     assert fake.envs[-1] is not None and fake.envs[-1]["HF_HUB_DISABLE_XET"] == "1"
     table = config(tmp_path)["backends"]["acestep"]
     assert table == {

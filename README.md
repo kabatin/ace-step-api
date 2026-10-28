@@ -137,8 +137,8 @@ What it installs (pinned in [`src/ace_step_api/setup/pins.py`](src/ace_step_api/
 
 - `ace-step`: the Apple Silicon port at `a97f051` (the checkout measured above) cloned into
   `<prefix>/ace-step-apple-silicon`, `uv sync` resolved as of 2026-10-17 (the port has no uv.lock; the
-  first sync writes one), then the checkout's own `download_main_model` (`ACE-Step/Ace-Step1.5`, ~10 GB,
-  MIT) into its `checkpoints/`.
+  first sync writes one), then `ACE-Step/Ace-Step1.5` at a fixed revision (~10 GB, MIT) into its
+  `checkpoints/` (what its `download_main_model` does, which can only fetch the latest).
 - `minimax-music3`: a Python 3.12 venv in `<prefix>/minimax-music3/.venv` with `mlx-audio==0.5.9`, then
   `hf download mlx-community/MiniMax-Music3-mxfp8` at a fixed revision (~13 GB) into
   `~/.local/share/minimax-music3/hf`. **Licence:** commercial use is allowed if the product shows

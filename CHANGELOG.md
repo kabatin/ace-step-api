@@ -6,7 +6,7 @@
 
 - `setup [--models ace-step,minimax-music3] [--check] [--yes] [--json] [--lan] [--service] [--port N]
   [--prefix DIR] [--label-suffix S] [--coordinate-with NAME=HEALTH_URL ...]`. `ace-step` clones the
-  Apple Silicon port at a pinned commit, `uv sync`s it and runs its `download_main_model`;
+  Apple Silicon port at a pinned commit, `uv sync`s it and fetches `ACE-Step/Ace-Step1.5` at a pinned revision;
   `minimax-music3` makes a Python 3.12 venv with `mlx-audio==0.5.9` and downloads
   `mlx-community/MiniMax-Music3-mxfp8` at a pinned revision. Either works alone. Pins live in
   `setup/pins.py`.

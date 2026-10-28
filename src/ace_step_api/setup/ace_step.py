@@ -1,7 +1,9 @@
 """Component ``ace-step``: the ACE-Step 1.5 Apple Silicon port, its environment and models.
 
-Clones the pinned commit under ``--prefix``, ``uv sync`` in it, then runs the checkout's own
-``download_main_model`` (``ACE-Step/Ace-Step1.5`` into ``checkpoints/``, ~10 GB). A path the
+Clones the pinned commit under ``--prefix``, ``uv sync`` in it, then fetches
+``ACE-Step/Ace-Step1.5`` at a pinned revision into ``checkpoints/`` (~10 GB) with the checkout's own
+huggingface_hub: the same ``snapshot_download(local_dir=...)`` as its ``download_main_model``,
+which only knows main (and then finds the files complete). A path the
 config file already names (``project_root``, ``python``, ``hf_home``) is used instead of the
 default under the prefix: setup never rewrites a key that is there.
 """
@@ -19,13 +21,11 @@ from ace_step_api.setup.component import Context, Plan, missing_keys
 from ace_step_api.setup.tools import SetupError
 from ace_step_api.setup.watchdog import dir_size, run_watched
 
-# force=True only skips the "folders exist" shortcut: Hugging Face resumes what is there
+# argv: repo, revision, checkpoints dir; Hugging Face resumes the .incomplete files it left
 DOWNLOAD_SCRIPT = (
     "import sys\n"
-    "from acestep.model_downloader import download_main_model\n"
-    "ok, message = download_main_model(prefer_source='huggingface', force=True)\n"
-    "print(message, file=sys.stderr)\n"
-    "sys.exit(0 if ok else 1)\n"
+    "from huggingface_hub import snapshot_download\n"
+    "snapshot_download(repo_id=sys.argv[1], revision=sys.argv[2], local_dir=sys.argv[3])\n"
 )
 UNTOUCHED = "using the existing checkout {root} at {head} (setup does not change its version)"
 
@@ -107,7 +107,14 @@ class AceStepComponent:
             tools.emit(f"ace-step: downloading {pins.ACE_STEP_MODEL_REPO} (~10 GB)")
             run_watched(
                 "ace-step",
-                [str(python), "-c", DOWNLOAD_SCRIPT],
+                [
+                    str(python),
+                    "-c",
+                    DOWNLOAD_SCRIPT,
+                    pins.ACE_STEP_MODEL_REPO,
+                    pins.ACE_STEP_MODEL_REVISION,
+                    str(root / "checkpoints"),
+                ],
                 root / "checkpoints",
                 tools,
                 env={

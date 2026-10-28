@@ -14,9 +14,9 @@ ACE_STEP_EXCLUDE_NEWER = "2026-10-17T00:00:00Z"
 # the port's MLX language model fails to load its checkpoint and falls back to PyTorch
 ACE_STEP_LM_BACKEND = "pt"
 ACE_STEP_HF_HOME = "~/.local/share/ace-step-api/hf"
-# download_main_model() fetches this repository's main branch; the commit it was tested with
+# the checkout's download_main_model() would fetch main: setup fetches this commit instead
 ACE_STEP_MODEL_REPO = "ACE-Step/Ace-Step1.5"
-ACE_STEP_MODEL_TESTED_REVISION = "19671f406d603126926c1b7e2adc169acbcade22"
+ACE_STEP_MODEL_REVISION = "19671f406d603126926c1b7e2adc169acbcade22"
 ACE_STEP_MODEL_BYTES = 10_092_102_593  # the repository's files at that revision
 # estimates: the port's environment (PyTorch, transformers, gradio, ...) and its checkout
 ACE_STEP_ENV_BYTES = 2_500_000_000
