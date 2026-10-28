@@ -129,20 +129,32 @@ def run_setup(
     base = Report(action, True, config_path, machine, svc.as_json(healthy=False))
     try:
         existing = config_write.read(config_path)
-        settings = _settings(environ, config_path)
-    except SetupError as exc:
+    except SetupError as exc:  # not TOML at all: nothing to merge into
         return EXIT_FAILED, replace(base, ok=False, error=str(exc))
-    url = f"http://127.0.0.1:{opts.port or settings.port}"
-    base = replace(base, url=url, lan=_is_lan(settings), token_set=settings.token is not None)
+    # a config the server rejects (e.g. a LAN host without a token) is what setup may fix
+    try:
+        settings: Settings | None = _settings(environ, config_path)
+        invalid = None
+    except SetupError as exc:
+        settings, invalid = None, str(exc)
+    view = _view(settings, existing)
+    url = f"http://127.0.0.1:{opts.port or view.port}"
+    base = replace(base, url=url, lan=view.lan, token_set=view.token is not None)
     ctx = Context(prefix, existing.get("backends", {}), tools)
     selected = [c for c in COMPONENTS if c.id in opts.models]
     plans = {c.id: _plan(c, ctx) for c in selected}
 
     if opts.check:
-        healthy = tools.http_status(f"{url}/v1/health", _token(settings)) == 200
+        healthy = tools.http_status(f"{url}/v1/health", view.token) == 200
         outcomes = tuple(_checked(c, plans[c.id], machine) for c in selected)
-        ok = _ok(outcomes, opts.explicit, check=True)
-        report = replace(base, ok=ok, components=outcomes, service=svc.as_json(healthy=healthy))
+        ok = invalid is None and _ok(outcomes, opts.explicit, check=True)
+        report = replace(
+            base,
+            ok=ok,
+            components=outcomes,
+            service=svc.as_json(healthy=healthy),
+            error=invalid,
+        )
         return (EXIT_OK if ok else EXIT_FAILED), report
 
     cannot = {c.id: why for c in selected if (why := _unsupported(plans[c.id], machine))}
@@ -172,7 +184,7 @@ def run_setup(
     base = replace(
         base,
         url=f"http://127.0.0.1:{settings.port}",
-        lan=_is_lan(settings),
+        lan=_is_lan(settings.host),
         token_set=settings.token is not None,
     )
     report = replace(base, ok=_ok(outcomes, opts.explicit), components=outcomes)
@@ -195,8 +207,27 @@ def _token(settings: Settings) -> str | None:
     return settings.token.get_secret_value() if settings.token else None
 
 
-def _is_lan(settings: Settings) -> bool:
-    return settings.host not in ("127.0.0.1", "localhost", "::1")
+def _is_lan(host: str) -> bool:
+    return host not in ("127.0.0.1", "localhost", "::1")
+
+
+@dataclass(frozen=True)
+class _View:
+    port: int
+    lan: bool
+    token: str | None
+
+
+def _view(settings: Settings | None, raw: Mapping[str, Any]) -> _View:
+    """Port, LAN and token from the settings, or from the raw file when the server rejects it."""
+    if settings is not None:
+        return _View(settings.port, _is_lan(settings.host), _token(settings))
+    port, host, token = raw.get("port"), raw.get("host"), raw.get("token")
+    return _View(
+        port if isinstance(port, int) and not isinstance(port, bool) else DEFAULT_PORT,
+        _is_lan(host) if isinstance(host, str) else False,
+        token if isinstance(token, str) else None,
+    )
 
 
 def _plan(component: Component, ctx: Context) -> Plan | SetupError:

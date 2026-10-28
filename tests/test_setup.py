@@ -638,3 +638,41 @@ def test_usage_errors_without_json_print_usage_and_exit_2(
     captured = capsys.readouterr()
     assert captured.out == ""
     assert "usage:" in captured.err and "--no-such-flag" in captured.err
+
+
+# -- a config the server rejects -----------------------------------------------------------------
+def lan_without_token(tmp_path: Path) -> Path:
+    cfg = tmp_path / "config" / "config.toml"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text('host = "0.0.0.0"\nport = 9100\n')
+    return cfg
+
+
+def test_setup_runs_on_an_invalid_config_and_lan_fixes_it(fake: Fake, tmp_path: Path) -> None:
+    lan_without_token(tmp_path)
+    code, report = setup(fake, tmp_path, options(tmp_path, "minimax-music3", lan=True, yes=True))
+    data = config(tmp_path)
+    assert data["host"] == "0.0.0.0" and len(data["token"]) >= 32 and data["port"] == 9100
+    assert report.token_set and report.url == "http://127.0.0.1:9100"
+    assert "invalid configuration" not in (report.error or "")
+    assert code == 1  # only because minimax has no fake installer here
+
+
+def test_check_on_an_invalid_config_still_reports_the_components(
+    fake: Fake, tmp_path: Path
+) -> None:
+    lan_without_token(tmp_path)
+    code, report = setup(fake, tmp_path, options(tmp_path, check=True))
+    assert code == 1
+    assert "invalid configuration" in (report.error or "")
+    assert status(report) == {"ace-step": "missing", "minimax-music3": "missing"}
+    assert report.url == "http://127.0.0.1:9100"
+
+
+def test_install_that_leaves_the_config_invalid_says_so(fake: Fake, tmp_path: Path) -> None:
+    installed_minimax(tmp_path)
+    cfg = tmp_path / "config" / "config.toml"
+    cfg.write_text('host = "0.0.0.0"\n' + cfg.read_text())
+    code, report = setup(fake, tmp_path, options(tmp_path, "minimax-music3"))
+    assert code == 1
+    assert "invalid" in (report.error or "")
