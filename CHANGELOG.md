@@ -1,7 +1,6 @@
 # Changelog
 
-## Unreleased
-
+## 0.1.1 — 2026-10-28
 `ace-step-api setup`: install the engines with one command, the same command as the other GPU servers.
 
 - `setup [--models ace-step,minimax-music3] [--check] [--yes] [--json] [--lan] [--service] [--port N]

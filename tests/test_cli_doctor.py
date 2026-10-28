@@ -240,7 +240,7 @@ def test_doctor_exits_0_with_one_engine_and_1_with_none(
 def test_version(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit):
         cli.main(["--version"])
-    assert "ace-step-api 0.1.0" in capsys.readouterr().out
+    assert "ace-step-api 0.1.1" in capsys.readouterr().out
 
 
 def test_workflows_and_config_hide_the_token(

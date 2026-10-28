@@ -66,7 +66,7 @@ def poll(client: TestClient, job_id: str, want: str, timeout: float = 5) -> dict
 def test_health_matches_vpipe_api_shape(client: TestClient) -> None:
     expected = {
         "status": "ok",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "running": 0,
         "waiting": 0,
         "max_waiting": 1,
@@ -142,7 +142,7 @@ def test_a_minimax_job_end_to_end(tmp_path: Path) -> None:
 def test_capabilities_match_the_contract(tmp_path: Path, backend: FakeMusicBackend) -> None:
     with make_client(tmp_path, backend, waits_for=["vpipe-api"]) as c:
         body = c.get("/v1/capabilities").json()
-    assert body["version"] == "0.1.0"
+    assert body["version"] == "0.1.1"
     assert body["queue"] == {"max_running": 1, "max_waiting": 1}
     assert body["coordination"] == {"waits_for": ["vpipe-api"]}
     music = next(w for w in body["workflows"] if w["id"] == "ace-step-1.5")

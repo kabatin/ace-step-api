@@ -50,7 +50,7 @@ Identical to wan-api:
 ### `GET /healthz` and `GET /v1/health`
 
 ```json
-{ "status": "ok", "version": "0.1.0", "running": 1, "waiting": 0, "max_waiting": 2, "waiting_for_peer": 0,
+{ "status": "ok", "version": "0.1.1", "running": 1, "waiting": 0, "max_waiting": 2, "waiting_for_peer": 0,
   "workflows": {
     "ace-step-1.5":   { "available": true,  "loaded": false, "reason": null },
     "minimax-music3": { "available": true,  "loaded": true,  "reason": null }
@@ -62,7 +62,7 @@ as in vpipe-api, with one exception: while the job at the head of the queue is i
 another GPU server, the queued jobs are counted in `waiting_for_peer` instead of `waiting` (see
 *Coordination*).
 
-`workflows` (added after 0.1.0; the other fields are unchanged) has one entry per workflow:
+`workflows` (added in 0.1.1; the other fields are unchanged) has one entry per workflow:
 `available` — its engine is installed with its model files, so jobs are accepted (otherwise a submit
 gets `503 workflow_unavailable` and `reason` says why, without paths); `loaded` — its models are in
 memory right now (`false` while idle is normal: the next job loads them; at most one engine is loaded
@@ -75,7 +75,7 @@ descriptors** — a client must not assume values that are not listed here.
 
 ```json
 {
-  "version": "0.1.0",
+  "version": "0.1.1",
   "queue": { "max_running": 1, "max_waiting": 2 },
   "workflows": [{
     "id": "ace-step-1.5",

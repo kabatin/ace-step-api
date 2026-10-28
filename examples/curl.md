@@ -9,7 +9,7 @@ AUTH=()                                   # or: AUTH=(-H "Authorization: Bearer 
 
 ```sh
 curl -s "${AUTH[@]}" "$API/healthz"
-# {"status":"ok","version":"0.1.0","running":0,"waiting":0,"max_waiting":2,"waiting_for_peer":0,
+# {"status":"ok","version":"0.1.1","running":0,"waiting":0,"max_waiting":2,"waiting_for_peer":0,
 #  "workflows":{"ace-step-1.5":{…},"minimax-music3":{…}}}
 curl -s "${AUTH[@]}" "$API/v1/capabilities" | jq '{queue, coordination, w: .workflows[] | {id, duration_sec, count, typical_seconds}}'
 ```

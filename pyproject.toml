@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "ace-step-api"
-version = "0.1.0"
+version = "0.1.1"
 description = "Make music with ACE-Step 1.5 or MiniMax Music 3 on an Apple Silicon Mac as an HTTP job API"
 readme = "README.md"
 license = "Apache-2.0"

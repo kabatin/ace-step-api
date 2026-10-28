@@ -438,7 +438,7 @@ def test_a_job_waits_queued_while_another_gpu_server_is_busy(
     # reported as waiting_for_peer so a server that waits for this one is not deadlocked
     assert client.get("/v1/health").json() | {} == {
         "status": "ok",
-        "version": "0.1.0",
+        "version": "0.1.1",
         "running": 0,
         "waiting": 0,
         "max_waiting": 1,
