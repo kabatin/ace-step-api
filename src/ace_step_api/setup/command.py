@@ -13,7 +13,13 @@ from pathlib import Path
 from typing import Any
 
 from ace_step_api import __version__
-from ace_step_api.settings import Settings, SettingsError, load_settings, resolve_config_path
+from ace_step_api.settings import (
+    DEFAULT_PORT,
+    Settings,
+    SettingsError,
+    load_settings,
+    resolve_config_path,
+)
 from ace_step_api.setup import config_write, pins, service
 from ace_step_api.setup.ace_step import AceStepComponent
 from ace_step_api.setup.component import Component, Context, Plan
@@ -359,11 +365,18 @@ def add_parser(sub: Any) -> None:
     )
 
 
-def options_from(args: Any) -> Options:
+def options_from(args: Any, env: Mapping[str, str]) -> Options:
+    """Everything that can be wrong with the arguments, found before anything runs (exit 2)."""
     if args.port is not None and not 1 <= args.port <= 65535:
         raise SetupError("--port must be 1-65535")
+    if args.label_suffix is not None:
+        service.check_suffix(args.label_suffix)
+        if args.port is None:
+            raise SetupError("--label-suffix needs --port: the real service has the default one")
+    if args.lan:
+        config_write.check_lan_env(env)
     for spec in args.coordinate_with:
-        config_write.parse_peer(spec)
+        config_write.check_peer(*config_write.parse_peer(spec), env)
     return Options(
         models=parse_models(args.models),
         check=args.check,
@@ -375,6 +388,21 @@ def options_from(args: Any) -> Options:
         label_suffix=args.label_suffix,
         coordinate_with=tuple(args.coordinate_with),
         config=Path(args.config) if args.config else None,
+    )
+
+
+def usage_report(message: str, args: Any, tools: Tools, env: Mapping[str, str]) -> Report:
+    """The complete report for an argument error (nothing was looked at but the machine)."""
+    config = Path(args.config) if getattr(args, "config", None) else None
+    prefix = DEFAULT_PREFIX.expanduser().absolute()
+    return Report(
+        action="check" if getattr(args, "check", False) else "install",
+        ok=False,
+        config_path=resolve_config_path(env, config),
+        machine=probe(prefix, tools),
+        service=service.service_for(tools, None).as_json(healthy=False),
+        url=f"http://127.0.0.1:{DEFAULT_PORT}",
+        error=message,
     )
 
 

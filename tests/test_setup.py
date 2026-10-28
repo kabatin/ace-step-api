@@ -429,11 +429,6 @@ def test_service_needs_the_installed_cli(fake: Fake, tmp_path: Path) -> None:
     assert fake.commands("launchctl") == []
 
 
-def test_label_suffix_is_validated(fake: Fake, tmp_path: Path) -> None:
-    with pytest.raises(SetupError):
-        setup(fake, tmp_path, options(tmp_path, check=True, label_suffix="../x"))
-
-
 # -- watchdog ------------------------------------------------------------------------------------
 def grow(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -513,3 +508,73 @@ def test_child_output_goes_to_stderr_and_the_server_venv_does_not_leak(
     assert captured.out == ""
     assert "out:none" in captured.err
     assert tools._run(["/nonexistent/tool"], None, None) == 127
+
+
+# -- usage errors: exit 2 with one complete JSON object --------------------------------------------
+REPORT_KEYS = {
+    "server",
+    "version",
+    "ok",
+    "action",
+    "url",
+    "lan",
+    "tokenSet",
+    "configPath",
+    "service",
+    "machine",
+    "components",
+}
+
+
+def usage_json(capsys: pytest.CaptureFixture[str], argv: list[str]) -> dict:
+    assert cli.main(["setup", "--json", *argv]) == 2
+    out = capsys.readouterr().out.strip().splitlines()
+    assert len(out) == 1
+    payload = json.loads(out[0])
+    assert payload.keys() >= REPORT_KEYS
+    assert payload["ok"] is False and payload["error"]
+    return payload
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--label-suffix", "../x", "--port", "9000"],
+        ["--label-suffix", "verify"],  # beside the real one it needs its own port
+        ["--port", "nope"],  # argparse's own error
+        ["--no-such-flag"],
+        ["--coordinate-with", "vpipe-api=ftp://x/v1/health"],
+        ["--coordinate-with", "no-equals"],
+    ],
+)
+def test_usage_errors_give_one_json_object(
+    capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+) -> None:
+    monkeypatch.setenv("ACE_STEP_API_CONFIG", str(tmp_path / "c.toml"))
+    usage_json(capsys, argv)
+
+
+def test_bad_lan_and_peer_tokens_in_the_environment_are_usage_errors(
+    capsys: pytest.CaptureFixture[str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ACE_STEP_API_CONFIG", str(tmp_path / "c.toml"))
+    monkeypatch.setenv("ACE_STEP_API_TOKEN", "short")
+    payload = usage_json(capsys, ["--lan"])
+    assert "short" not in json.dumps(payload)
+    monkeypatch.delenv("ACE_STEP_API_TOKEN")
+    monkeypatch.setenv("ACE_STEP_API_COORD_TOKEN_VPIPE_API", "has space")
+    payload = usage_json(capsys, ["--coordinate-with", "vpipe-api=http://127.0.0.1:8765/v1/health"])
+    assert "has space" not in json.dumps(payload)
+    assert not (tmp_path / "c.toml").exists()
+
+
+def test_usage_errors_without_json_print_usage_and_exit_2(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert cli.main(["setup", "--no-such-flag"]) == 2
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "usage:" in captured.err and "--no-such-flag" in captured.err

@@ -30,9 +30,14 @@ class Service:
         return {"installed": self.plist.is_file(), "label": self.label, "healthy": healthy}
 
 
-def service_for(tools: Tools, suffix: str | None) -> Service:
-    if suffix is not None and not _SUFFIX.fullmatch(suffix):
+def check_suffix(suffix: str) -> None:
+    if not _SUFFIX.fullmatch(suffix):
         raise SetupError("--label-suffix takes letters, digits and '-' (at most 32)")
+
+
+def service_for(tools: Tools, suffix: str | None) -> Service:
+    if suffix is not None:
+        check_suffix(suffix)
     tail = f".{suffix}" if suffix else ""
     return Service(
         label=LABEL + tail,

@@ -10,6 +10,7 @@ import resource
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import NoReturn
 
 from ace_step_api import __version__
 from ace_step_api.backends import build_backend
@@ -183,25 +184,33 @@ def _ask(prompt: str) -> bool:
         return False
 
 
+class UsageError(Exception):
+    def __init__(self, parser: argparse.ArgumentParser, message: str) -> None:
+        super().__init__(message)
+        self.parser = parser
+
+
+class _Parser(argparse.ArgumentParser):
+    """Raises instead of exiting, so ``setup --json`` can answer a usage error in JSON."""
+
+    def error(self, message: str) -> NoReturn:
+        raise UsageError(self, message)
+
+
+def _setup_usage(message: str, args: argparse.Namespace | None, as_json: bool) -> int:
+    _err(f"error: {message}")
+    if as_json:
+        namespace = args or argparse.Namespace()
+        _out(json.dumps(setup.usage_report(message, namespace, Tools(), os.environ).as_json()))
+    return setup.EXIT_USAGE
+
+
 def cmd_setup(args: argparse.Namespace) -> int:
     """Runs before (and without) loading the settings: a broken config is reported, not fatal."""
     try:
-        options = setup.options_from(args)
+        options = setup.options_from(args, os.environ)
     except SetupError as exc:
-        _err(f"error: {exc}")
-        if args.json:
-            _out(
-                json.dumps(
-                    {
-                        "server": "ace-step-api",
-                        "version": __version__,
-                        "ok": False,
-                        "action": "check" if args.check else "install",
-                        "error": str(exc),
-                    }
-                )
-            )
-        return setup.EXIT_USAGE
+        return _setup_usage(str(exc), args, args.json)
     confirm = _ask if sys.stdin.isatty() else None
     code, report = setup.run_setup(options, Tools(), confirm=confirm)
     if args.json:
@@ -213,7 +222,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="ace-step-api", description=__doc__)
+    parser = _Parser(prog="ace-step-api", description=__doc__)
     parser.add_argument("--version", action="version", version=f"ace-step-api {__version__}")
     parser.add_argument("--config", help="config file (default ~/.config/ace-step-api/config.toml)")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -234,7 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    words = list(sys.argv[1:] if argv is None else argv)
+    try:
+        args = build_parser().parse_args(words)
+    except UsageError as exc:
+        as_json = "setup" in words and "--json" in words
+        if not as_json:
+            exc.parser.print_usage(sys.stderr)
+        if "setup" in words:
+            return _setup_usage(str(exc), None, as_json)
+        _err(f"{exc.parser.prog}: error: {exc}")
+        return 2
     configure_logging()
     if args.command == "setup":
         try:

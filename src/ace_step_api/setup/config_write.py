@@ -140,17 +140,38 @@ def merge(existing: Mapping[str, Any], changes: Changes, env: Mapping[str, str])
     return data
 
 
-def _lan_token(current: Any, env: Mapping[str, str]) -> str:
+def check_lan_env(env: Mapping[str, str]) -> None:
+    """``--lan``: a token in the environment must meet the server's rule (checked up front)."""
     supplied = env.get(ENV_PREFIX + "TOKEN", "").strip()
-    token = supplied or (current if isinstance(current, str) else "") or secrets.token_urlsafe(32)
+    if supplied:
+        _check_token(supplied, f"{ENV_PREFIX}TOKEN")
+
+
+def check_peer(name: str, url: str, env: Mapping[str, str]) -> None:
+    """A ``--coordinate-with`` entry as the server would read it (URL, token from the env)."""
+    token = env.get(peer_token_env(name), "").strip()
+    entry = {"name": name, "health_url": url} | ({"token": token} if token else {})
+    try:
+        PeerServer.model_validate(entry)
+    except ValidationError as exc:  # field and rule only: never the offending value
+        problem = "; ".join(f"{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+        raise SetupError(f"--coordinate-with {name}: {problem}") from exc
+
+
+def _check_token(token: str, source: str) -> None:
     try:
         Settings.model_validate({"host": LAN_HOST, "token": token})
     except ValidationError as exc:  # the message never contains the token
-        source = f"{ENV_PREFIX}TOKEN" if supplied else "the config's token"
         raise SetupError(
             f"{source} does not meet the token rule",
             hint="use at least 32 printable ASCII characters without spaces (openssl rand -hex 32)",
         ) from exc
+
+
+def _lan_token(current: Any, env: Mapping[str, str]) -> str:
+    supplied = env.get(ENV_PREFIX + "TOKEN", "").strip()
+    token = supplied or (current if isinstance(current, str) else "") or secrets.token_urlsafe(32)
+    _check_token(token, f"{ENV_PREFIX}TOKEN" if supplied else "the config's token")
     return token
 
 
@@ -167,12 +188,8 @@ def _peers(
                 for peer in peers
             ]
             continue
-        entry = {"name": name, "health_url": url} | ({"token": token} if token else {})
-        try:
-            PeerServer.model_validate(entry)
-        except ValidationError as exc:
-            raise SetupError(f"--coordinate-with {name}: {exc.errors()[0]['msg']}") from exc
-        peers.append(entry)
+        check_peer(name, url, env)
+        peers.append({"name": name, "health_url": url} | ({"token": token} if token else {}))
         names.add(name)
     return peers
 
