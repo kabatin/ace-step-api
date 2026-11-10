@@ -2,6 +2,8 @@
 
 **Make music with ACE-Step 1.5 or MiniMax Music 3 on your Apple Silicon Mac, as an HTTP job API.**
 
+> One of the local generation servers behind **[iXA Video Creator](https://github.com/kabatin/ixa-video-creator)**, which turns a song into a music video on one Apple Silicon Mac. It also works on its own.
+
 `ace-step-api` is a small, safe job server around two music engines:
 [ACE-Step 1.5](https://github.com/ace-step/ACE-Step-1.5) (workflow `ace-step-1.5`) and
 [MiniMax Music 3](https://huggingface.co/MiniMaxAI/MiniMax-Music3) through
