@@ -453,8 +453,10 @@ def test_a_job_waits_queued_while_another_gpu_server_is_busy(
     done = client.get(f"/v1/jobs/{job['id']}").json()
     assert done["waiting_for"] is None
     timings = done["timings"]
-    # busy for >= 0.3 s, then started no sooner than 0.4 s after the last busy sighting
-    assert timings["coordination_seconds"] >= 0.6
+    # started no sooner than settle_seconds (0.4 s) after the last busy sighting. When that
+    # sighting happened is up to the poll thread's scheduling, so only the settle is asserted;
+    # "not started while busy" is the two ``backend.calls`` checks above
+    assert timings["coordination_seconds"] >= 0.4
     assert timings["queue_seconds"] < timings["coordination_seconds"]
     assert timings["total_seconds"] >= timings["queue_seconds"] + timings["coordination_seconds"]
     assert client.get("/v1/capabilities").json()["coordination"] == {"waits_for": ["vpipe-api"]}

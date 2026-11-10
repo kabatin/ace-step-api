@@ -26,7 +26,7 @@ from ace_step_api.backends.minimax import (
     MiniMaxBackend,
     MiniMaxOptions,
 )
-from ace_step_api.backends.process import PID_FILE
+from ace_step_api.backends.process import PID_FILE, process_info
 from ace_step_api.checks import Level
 from ace_step_api.jobs.queue import TIMEOUT_MARGIN_S
 from ace_step_api.settings import Settings, SettingsError, load_settings
@@ -264,6 +264,12 @@ def test_a_leftover_worker_is_reaped(tmp_path: Path) -> None:
         start_new_session=True,
     )
     try:
+        # Popen returns before the child has exec'd: until then ``ps`` still shows the test
+        # runner's own command line, and the reaper rightly leaves such a pid alone
+        deadline = time.monotonic() + 10
+        while WORKER_SCRIPT.name not in (process_info(proc.pid) or ("", 0.0))[0]:
+            assert time.monotonic() < deadline, "the worker never started"
+            time.sleep(0.02)
         (state / PID_FILE).write_text(str(proc.pid))
         assert backend.startup() == f"stopped leftover minimax_worker.py (pid {proc.pid})"
         proc.wait(timeout=10)
